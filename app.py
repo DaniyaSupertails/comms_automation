@@ -6,6 +6,7 @@ Configure via environment variables (DB_*, BQ_CREDENTIALS_PATH, optional SHOW_ER
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 from datetime import datetime
@@ -14,7 +15,8 @@ from typing import Literal
 import mysql.connector as sql
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -24,14 +26,14 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 app = FastAPI(title="Comms CSV Export")
-from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later restrict
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ---------------------------------------------------------------------------
 # Request model
@@ -734,6 +736,29 @@ def enrich_final_payload(selected: pd.DataFrame, cnx) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
+def _preview_rows_from_df(df: pd.DataFrame, limit: int = 50) -> tuple[int, list[dict]]:
+    """Row count and first N rows as JSON-serializable dicts (for /audience-preview)."""
+    n = int(len(df))
+    if n == 0 or df.empty:
+        return 0, []
+    sub = df.head(limit)
+    preferred = [
+        "email",
+        "customer_id",
+        "pet_name",
+        "final_phone",
+        "comms_label",
+        "comms_cohort",
+        "product_name",
+    ]
+    cols = [c for c in preferred if c in sub.columns]
+    if not cols:
+        cols = list(sub.columns)[:12]
+    export = sub[cols]
+    records = json.loads(export.to_json(orient="records", date_format="iso"))
+    return n, records
+
+
 def run_pipeline(req: AudienceRequest, cnx, bq) -> pd.DataFrame:
     eligible = get_eligible_customers(cnx)
     comms = build_comms_collapsed(cnx)
@@ -766,6 +791,56 @@ def run_pipeline(req: AudienceRequest, cnx, bq) -> pd.DataFrame:
 @app.get("/")
 def home():
     return {"status": "running"}
+
+
+@app.get("/get-templates")
+def get_templates(days: int = Query(7, gt=0, le=365)):
+    """Distinct template names from failed sends in the last `days` days (for Failed event UI)."""
+    cnx = None
+    try:
+        cnx = get_db_connection()
+        query = """
+            SELECT DISTINCT template_name
+            FROM comms_telle_logs
+            WHERE failed_at >= DATE_SUB(CURDATE(), INTERVAL %s DAY)
+              AND template_name IS NOT NULL
+              AND TRIM(template_name) != ''
+            ORDER BY template_name
+        """
+        df = pd.read_sql(query, cnx, params=[days])
+        templates = df["template_name"].dropna().astype(str).tolist()
+        return {"templates": templates}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("get-templates failed")
+        raise HTTPException(status_code=500, detail=http_detail(e)) from e
+    finally:
+        if cnx is not None:
+            cnx.close()
+
+
+@app.post("/audience-preview")
+def audience_preview(req: AudienceRequest):
+    """
+    Same audience logic as export: returns total match count and the first 50 rows
+    for quick QA in the builder UI.
+    """
+    cnx = None
+    try:
+        cnx = get_db_connection()
+        bq = get_bq_client()
+        df = run_pipeline(req, cnx, bq)
+        count, rows = _preview_rows_from_df(df, limit=50)
+        return {"count": count, "preview": rows}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("audience-preview failed")
+        raise HTTPException(status_code=500, detail=http_detail(e)) from e
+    finally:
+        if cnx is not None:
+            cnx.close()
 
 
 @app.post("/export-csv")
