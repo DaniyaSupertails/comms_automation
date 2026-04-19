@@ -1,6 +1,7 @@
 """
 Comms audience export API — logic aligned with comms_backend notebook.
-Configure via environment variables (DB_*, BQ_CREDENTIALS_PATH, optional SHOW_ERROR_DETAILS).
+Configure via environment: DB_*, BQ_PRIVATE_KEY, BQ_PRIVATE_KEY_ID (optional SHOW_ERROR_DETAILS).
+BigQuery non-secret fields are defined in _BQ_SERVICE_ACCOUNT_PUBLIC below.
 """
 
 from __future__ import annotations
@@ -33,6 +34,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# BigQuery service account (public fields only — secrets via env on Render)
+# ---------------------------------------------------------------------------
+_BQ_SERVICE_ACCOUNT_PUBLIC: dict[str, str] = {
+    "type": "service_account",
+    "project_id": "ga4-data-api-1681899023728",
+    "client_email": "daniya@ga4-data-api-1681899023728.iam.gserviceaccount.com",
+    "client_id": "101663420454472117352",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_x509_cert_url": (
+        "https://www.googleapis.com/robot/v1/metadata/x509/"
+        "daniya%40ga4-data-api-1681899023728.iam.gserviceaccount.com"
+    ),
+    "universe_domain": "googleapis.com",
+}
+
+
+def _bq_private_key_from_env() -> str:
+    """Render often stores PEM with literal \\n — normalize to real newlines."""
+    raw = (os.getenv("BQ_PRIVATE_KEY") or os.getenv("GOOGLE_PRIVATE_KEY") or "").strip()
+    if not raw:
+        return ""
+    return raw.replace("\\n", "\n").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -213,12 +240,35 @@ IN_CHUNK_SIZE = int(os.getenv("SQL_IN_CHUNK_SIZE", "3000"))
 # DB / BQ
 # ---------------------------------------------------------------------------
 def get_db_connection():
+    """
+    MySQL must be reachable from the Render host. Use your cloud DB hostname in DB_HOST
+    (not localhost — on Render there is no MySQL on localhost unless you add a private service).
+    """
+    host = (os.getenv("DB_HOST") or "").strip()
+    user = (os.getenv("DB_USER") or "").strip()
+    password = os.getenv("DB_PASSWORD") or ""
+    database = (os.getenv("DB_NAME") or "").strip()
+    if not host or not user or not database:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Database not configured: set DB_HOST, DB_USER, DB_PASSWORD, and DB_NAME "
+                "in Render Environment. Use your managed MySQL hostname (e.g. AWS RDS, "
+                "PlanetScale, or Render Private Service), not localhost."
+            ),
+        )
+    if host in ("localhost", "127.0.0.1", "::1"):
+        logger.warning(
+            "DB_HOST is %s — connections from Render web services to localhost will fail "
+            "unless MySQL runs in the same container.",
+            host,
+        )
     try:
         return sql.connect(
-            host=os.getenv("DB_HOST"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            database=os.getenv("DB_NAME"),
+            host=host,
+            user=user,
+            password=password,
+            database=database,
             connection_timeout=10,
         )
     except Exception as e:
@@ -227,12 +277,28 @@ def get_db_connection():
 
 
 def get_bq_client():
+    """
+    Builds credentials from _BQ_SERVICE_ACCOUNT_PUBLIC in this file plus:
+    - BQ_PRIVATE_KEY (or GOOGLE_PRIVATE_KEY): PEM including BEGIN/END lines
+    - BQ_PRIVATE_KEY_ID (or GOOGLE_PRIVATE_KEY_ID): key id string
+    """
     try:
-        path = os.getenv("BQ_CREDENTIALS_PATH")
-        if not path:
-            raise ValueError("BQ_CREDENTIALS_PATH not set")
-        creds = service_account.Credentials.from_service_account_file(path)
-        return bigquery.Client(credentials=creds)
+        private_key = _bq_private_key_from_env()
+        private_key_id = (
+            os.getenv("BQ_PRIVATE_KEY_ID") or os.getenv("GOOGLE_PRIVATE_KEY_ID") or ""
+        ).strip()
+        if not private_key or not private_key_id:
+            raise ValueError(
+                "Set BQ_PRIVATE_KEY and BQ_PRIVATE_KEY_ID in the environment (Render)."
+            )
+        info = {
+            **_BQ_SERVICE_ACCOUNT_PUBLIC,
+            "private_key_id": private_key_id,
+            "private_key": private_key,
+        }
+        creds = service_account.Credentials.from_service_account_info(info)
+        project = info.get("project_id")
+        return bigquery.Client(credentials=creds, project=project)
     except Exception as e:
         logger.exception("BigQuery client init failed")
         raise HTTPException(status_code=500, detail=f"BQ connection failed: {e!s}") from e
