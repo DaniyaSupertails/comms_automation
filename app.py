@@ -58,7 +58,21 @@ def get_bq_connection():
 @app.post("/get-audience")
 def get_audience(req: AudienceRequest):
 
-    return {
-        "message": "API working",
-        "received": req.dict()
-    }
+    try:
+        cnx = get_db_connection()
+        cursor = cnx.cursor()
+
+        cursor.execute("SELECT 1")
+        result = cursor.fetchone()
+
+        return {
+            "status": "success",
+            "db_check": result[0],
+            "received": req.dict()
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
