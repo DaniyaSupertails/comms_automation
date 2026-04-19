@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Comms Dashboard</title>
+
+    <style>
+        body {
+            font-family: Arial;
+            background: #f5f6fa;
+            padding: 40px;
+        }
+
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            width: 400px;
+            box-shadow: 0px 2px 10px rgba(0,0,0,0.1);
+        }
+
+        h2 {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-top: 10px;
+        }
+
+        input, select {
+            width: 100%;
+            padding: 8px;
+            margin-top: 5px;
+        }
+
+        button {
+            margin-top: 20px;
+            width: 100%;
+            padding: 10px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+            border-radius: 5px;
+        }
+
+        button:hover {
+            background: #45a049;
+        }
+
+        #status {
+            margin-top: 15px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="card">
+    <h2>Comms Audience Builder</h2>
+
+    <label>Event Type</label>
+    <select id="event_type" onchange="toggleTemplates()">
+        <option value="sent">Sent</option>
+        <option value="delivered">Delivered</option>
+        <option value="failed">Failed</option>
+    </select>
+
+    <label>Days</label>
+    <input type="number" id="days" value="10">
+
+    <label>Purchase Days</label>
+    <input type="number" id="purchase_days" value="360">
+
+    <label>Daily Target</label>
+    <input type="number" id="daily_target" value="1000">
+
+    <div id="template_box" style="display:none;">
+        <label>Templates (comma separated)</label>
+        <input type="text" id="templates" placeholder="template1,template2">
+    </div>
+
+    <button onclick="exportCSV()">Export CSV</button>
+
+    <div id="status"></div>
+</div>
+
+<script>
+
+const BASE_URL = "https://dashboard.render.com/web/new";  // 👈 CHANGE THIS
+
+function toggleTemplates() {
+    const eventType = document.getElementById("event_type").value;
+    document.getElementById("template_box").style.display =
+        (eventType === "failed") ? "block" : "none";
+}
+
+async function exportCSV() {
+
+    const status = document.getElementById("status");
+    status.innerText = "Processing...";
+
+    const payload = {
+        event_type: document.getElementById("event_type").value,
+        days: parseInt(document.getElementById("days").value),
+        purchase_days: parseInt(document.getElementById("purchase_days").value),
+        daily_target: parseInt(document.getElementById("daily_target").value),
+        selected_templates: []
+    };
+
+    // handle templates
+    const rawTemplates = document.getElementById("templates").value;
+    if (payload.event_type === "failed" && rawTemplates) {
+        payload.selected_templates = rawTemplates.split(",").map(x => x.trim());
+    }
+
+    try {
+        const response = await fetch(`${BASE_URL}/export-csv`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            throw new Error("API failed");
+        }
+
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "comms_output.csv";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+
+        status.innerText = "✅ Download complete";
+
+    } catch (err) {
+        status.innerText = "❌ Error: " + err.message;
+    }
+}
+
+</script>
+
+</body>
+</html>
