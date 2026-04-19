@@ -696,7 +696,9 @@
 
 <script>
 
-const BASE_URL = "https://comms-automation.onrender.com";  // ✅ FIXED
+/** Same origin when served by FastAPI; full URL when opening HTML from disk (file://). */
+const BASE_URL =
+    window.location.protocol === "file:" ? "https://comms-automation.onrender.com" : "";
 
 let selectedEvent = "delivered";
 let previewTimer = null;
