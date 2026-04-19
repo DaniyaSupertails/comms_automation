@@ -1,149 +1,920 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Comms Dashboard</title>
-
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Comms Base Builder</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
     <style>
+        /* Aligned with supertails.com Shopify theme.css tokens */
+        :root {
+            --bg-page: #f9f9fb;
+            --surface: #ffffff;
+            --accent: #ef6c00;
+            --accent-hover: #ff8623;
+            --accent-pressed: #d56000;
+            --accent-soft: rgba(239, 108, 0, 0.1);
+            --text: #000000;
+            --text-label: #242430;
+            --text-muted: #5c5c66;
+            --border: #e8e8e1;
+            --sent: #137390;
+            --delivered: #08870f;
+            --failed: #ba4444;
+            --shadow: 0 10px 36px rgba(0, 0, 0, 0.07);
+            --focus-ring: rgba(239, 108, 0, 0.22);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
         body {
-            font-family: Arial;
-            background: #f5f6fa;
-            padding: 40px;
+            margin: 0;
+            min-height: 100vh;
+            font-family: "Inter", system-ui, -apple-system, sans-serif;
+            background: var(--bg-page);
+            color: var(--text);
+            padding: clamp(24px, 5vw, 48px);
+            position: relative;
         }
 
-        .card {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            width: 400px;
-            box-shadow: 0px 2px 10px rgba(0,0,0,0.1);
+        /* Subtle pattern (primary orange + scheme lime from theme) */
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image:
+                radial-gradient(circle at 12% 18%, rgba(239, 108, 0, 0.06) 0 35%, transparent 36%),
+                radial-gradient(circle at 88% 12%, rgba(188, 216, 95, 0.12) 0 32%, transparent 33%),
+                radial-gradient(circle at 22% 72%, rgba(239, 108, 0, 0.045) 0 28%, transparent 29%),
+                radial-gradient(circle at 78% 65%, rgba(19, 115, 144, 0.05) 0 30%, transparent 31%),
+                radial-gradient(circle at 50% 40%, rgba(239, 108, 0, 0.035) 0 40%, transparent 41%);
+            z-index: 0;
         }
 
-        h2 {
-            margin-bottom: 20px;
+        .container {
+            position: relative;
+            z-index: 1;
+            max-width: 920px;
+            margin: 0 auto;
+            background: var(--surface);
+            padding: 36px 40px 40px;
+            border-radius: 22px;
+            box-shadow: var(--shadow);
         }
 
-        label {
-            display: block;
-            margin-top: 10px;
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 14px;
+            border-radius: 999px;
+            background: var(--accent);
+            color: #fff;
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            margin-bottom: 18px;
         }
 
-        input, select {
+        .badge-icon {
+            width: 14px;
+            height: 14px;
+            display: inline-block;
+        }
+
+        h1 {
+            margin: 0 0 10px;
+            font-size: 1.75rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            line-height: 1.2;
+        }
+
+        h1 .accent {
+            color: var(--accent);
+        }
+
+        .subtitle {
+            margin: 0 0 32px;
+            font-size: 0.95rem;
+            color: var(--text-muted);
+            line-height: 1.5;
+            max-width: 36em;
+        }
+
+        .field {
+            margin-bottom: 28px;
+        }
+
+        .field-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--text-label);
+            margin-bottom: 12px;
+        }
+
+        .field-label svg {
+            flex-shrink: 0;
+            opacity: 0.85;
+        }
+
+        .text-input {
             width: 100%;
-            padding: 8px;
-            margin-top: 5px;
+            padding: 12px 14px;
+            border: 1px solid var(--border);
+            border-radius: 11px;
+            font-size: 0.95rem;
+            font-family: inherit;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
         }
 
-        button {
-            margin-top: 20px;
-            width: 100%;
-            padding: 10px;
-            background: #4CAF50;
-            color: white;
-            border: none;
+        .text-input::placeholder {
+            color: #9ca3af;
+            font-style: italic;
+        }
+
+        .text-input:focus {
+            outline: none;
+            border-color: rgba(239, 108, 0, 0.55);
+            box-shadow: 0 0 0 3px var(--focus-ring);
+        }
+
+        .events {
+            display: flex;
+            gap: 12px;
+            margin-top: 0;
+        }
+
+        .event-card {
+            flex: 1;
+            min-height: 108px;
+            padding: 16px 12px;
+            border-radius: 14px;
+            border: 2px solid var(--border);
             cursor: pointer;
-            border-radius: 5px;
+            text-align: center;
+            background: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
         }
 
-        button:hover {
-            background: #45a049;
+        .event-card:hover {
+            border-color: #d4d4ce;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.05);
+        }
+
+        .event-card .ev-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .event-card .ev-label {
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--text-label);
+        }
+
+        #sent .ev-icon {
+            background: rgba(19, 115, 144, 0.12);
+            color: var(--sent);
+        }
+
+        #delivered .ev-icon {
+            background: rgba(8, 135, 15, 0.12);
+            color: var(--delivered);
+        }
+
+        #failed .ev-icon {
+            background: rgba(186, 68, 68, 0.12);
+            color: var(--failed);
+        }
+
+        #sent.active {
+            border-color: rgba(19, 115, 144, 0.5);
+            background: rgba(19, 115, 144, 0.06);
+        }
+
+        #delivered.active {
+            border-color: rgba(8, 135, 15, 0.5);
+            background: rgba(8, 135, 15, 0.08);
+        }
+
+        #failed.active {
+            border-color: rgba(186, 68, 68, 0.45);
+            background: rgba(186, 68, 68, 0.06);
+        }
+
+        .event-card.active .ev-label {
+            color: var(--text);
+        }
+
+        .check-corner {
+            display: none;
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .event-card {
+            position: relative;
+        }
+
+        .event-card.active .check-corner {
+            display: flex;
+        }
+
+        #sent.active .check-corner {
+            background: rgba(19, 115, 144, 0.2);
+            color: var(--sent);
+        }
+
+        #delivered.active .check-corner {
+            background: rgba(8, 135, 15, 0.22);
+            color: #06600b;
+        }
+
+        #failed.active .check-corner {
+            background: rgba(186, 68, 68, 0.2);
+            color: var(--failed);
+        }
+
+        .select-like,
+        .field-input {
+            width: 100%;
+            padding: 12px 14px;
+            margin-top: 0;
+            border: 1px solid var(--border);
+            border-radius: 11px;
+            font-size: 0.95rem;
+            font-family: inherit;
+            background: #fff;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+
+        .field-input:focus {
+            outline: none;
+            border-color: rgba(239, 108, 0, 0.55);
+            box-shadow: 0 0 0 3px var(--focus-ring);
+        }
+
+        select.select-like {
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+            padding-right: 40px;
+            cursor: pointer;
+        }
+
+        .btn-primary {
+            margin-top: 8px;
+            padding: 14px 20px;
+            width: 100%;
+            background: var(--accent);
+            color: #fff;
+            border: none;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            transition: background 0.15s ease, transform 0.1s ease;
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-hover);
+        }
+
+        .btn-primary:active {
+            transform: scale(0.99);
+            background: var(--accent-pressed);
         }
 
         #status {
-            margin-top: 15px;
-            font-weight: bold;
+            margin-top: 14px;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+        }
+
+        #template_box label {
+            display: block;
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--text-label);
+            margin-bottom: 8px;
+        }
+
+        #templates {
+            width: 100%;
+            margin-top: 8px;
+            border: 1px solid var(--border);
+            border-radius: 11px;
+            padding: 8px;
+            font-family: inherit;
+        }
+
+        .insight-strip {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+            margin-bottom: 28px;
+        }
+
+        .insight-card {
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 16px 18px;
+            background: linear-gradient(180deg, #fff 0%, #fafafa 100%);
+        }
+
+        .insight-card--primary {
+            border-color: rgba(239, 108, 0, 0.28);
+            background: linear-gradient(135deg, rgba(239, 108, 0, 0.06) 0%, #fff 55%);
+        }
+
+        .insight-card__head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-label);
+            margin-bottom: 8px;
+        }
+
+        .live-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--delivered);
+            box-shadow: 0 0 0 0 rgba(8, 135, 15, 0.45);
+            animation: livePulse 2s ease-out infinite;
+        }
+
+        @keyframes livePulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(8, 135, 15, 0.45);
+            }
+            70% {
+                box-shadow: 0 0 0 8px rgba(8, 135, 15, 0);
+            }
+            100% {
+                box-shadow: 0 0 0 0 rgba(8, 135, 15, 0);
+            }
+        }
+
+        .insight-card__value {
+            font-size: 2rem;
+            font-weight: 700;
+            letter-spacing: -0.03em;
+            line-height: 1.1;
+            color: var(--text);
+            font-variant-numeric: tabular-nums;
+        }
+
+        .insight-card__hint {
+            margin: 8px 0 0;
+            font-size: 0.8125rem;
+            color: var(--text-muted);
+            line-height: 1.45;
+        }
+
+        .insight-card__actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 12px;
+        }
+
+        .btn-secondary {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 8px 14px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: #fff;
+            font-size: 0.875rem;
+            font-weight: 600;
+            font-family: inherit;
+            color: var(--text-label);
+            cursor: pointer;
+            transition: border-color 0.15s ease, background 0.15s ease;
+        }
+
+        .btn-secondary:hover {
+            border-color: rgba(239, 108, 0, 0.45);
+            background: rgba(239, 108, 0, 0.04);
+        }
+
+        .btn-link {
+            border: none;
+            background: none;
+            padding: 0;
+            font-size: 0.8125rem;
+            font-weight: 600;
+            font-family: inherit;
+            color: var(--accent);
+            cursor: pointer;
+            text-decoration: underline;
+            text-underline-offset: 3px;
+        }
+
+        .btn-link:hover {
+            color: var(--accent-hover);
+        }
+
+        .template-toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 14px 18px;
+            margin-bottom: 10px;
+        }
+
+        .template-toolbar__label {
+            font-size: 0.8125rem;
+            color: var(--text-muted);
+        }
+
+        .preview-section {
+            margin-top: 8px;
+            margin-bottom: 8px;
+        }
+
+        .preview-section__head {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .preview-section__title {
+            margin: 0;
+            font-size: 1rem;
+            font-weight: 700;
+            color: var(--text);
+        }
+
+        .preview-section__meta {
+            font-size: 0.8125rem;
+            color: var(--text-muted);
+        }
+
+        .table-wrap {
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: auto;
+            max-height: 320px;
+            background: #fff;
+        }
+
+        .preview-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.8125rem;
+        }
+
+        .preview-table th,
+        .preview-table td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+            white-space: nowrap;
+        }
+
+        .preview-table th {
+            position: sticky;
+            top: 0;
+            background: #f9f9fb;
+            font-weight: 600;
+            color: var(--text-label);
+            z-index: 1;
+        }
+
+        .preview-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .preview-table tbody tr:hover td {
+            background: rgba(239, 108, 0, 0.04);
+        }
+
+        .preview-empty {
+            margin: 0;
+            padding: 14px;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            border: 1px dashed var(--border);
+            border-radius: 12px;
+            text-align: center;
+        }
+
+        .export-block {
+            margin-top: 24px;
+            padding-top: 8px;
+            border-top: 1px solid var(--border);
+        }
+
+        @media (max-width: 560px) {
+            .events {
+                flex-direction: column;
+            }
+
+            .container {
+                padding: 28px 22px 32px;
+            }
+
+            .insight-strip {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
-
 <body>
 
-<div class="card">
-    <h2>Comms Audience Builder</h2>
+<div class="container">
 
-    <label>Event Type</label>
-    <select id="event_type" onchange="toggleTemplates()">
-        <option value="sent">Sent</option>
-        <option value="delivered">Delivered</option>
-        <option value="failed">Failed</option>
-    </select>
-
-    <label>Days</label>
-    <input type="number" id="days" value="10">
-
-    <label>Purchase Days</label>
-    <input type="number" id="purchase_days" value="360">
-
-    <label>Daily Target</label>
-    <input type="number" id="daily_target" value="1000">
-
-    <div id="template_box" style="display:none;">
-        <label>Templates (comma separated)</label>
-        <input type="text" id="templates" placeholder="template1,template2">
+    <div class="badge" aria-hidden="true">
+        <svg class="badge-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M12 2l1.09 3.26L16 6.5l-3.26 1.09L12 10.5l-1.09-3.26L8 6.5l3.26-1.09L12 2zm7 7l.91 2.73L22 12l-2.73.91L19 15.5l-.91-2.73L15.5 12l2.73-.91L19 9zm-14 0l.91 2.73L8 12l-2.73.91L5 15.5l-.91-2.73L1.5 12l2.73-.91L5 9zm7 5l1.09 3.26L16 18.5l-3.26 1.09L12 22.5l-1.09-3.26L8 18.5l3.26-1.09L12 14z"/>
+        </svg>
+        Supertails Studio
     </div>
 
-    <button onclick="exportCSV()">Export CSV</button>
+    <h1>Comms Base <span class="accent">Builder</span></h1>
+    <p class="subtitle">Sniff out the right pet parents — segment by event, time window and purchase behavior.</p>
 
-    <div id="status"></div>
+    <section class="insight-strip" aria-label="Audience insights">
+        <div class="insight-card insight-card--primary">
+            <div class="insight-card__head">
+                <span class="live-dot" aria-hidden="true"></span>
+                Live audience count
+            </div>
+            <div class="insight-card__value" id="audience-count">—</div>
+            <p class="insight-card__hint">Same rules as your CSV export — updates when filters change.</p>
+        </div>
+        <div class="insight-card">
+            <div class="insight-card__head">Preview quality</div>
+            <p class="insight-card__hint">Spot-check the first 50 users before you ship the full export.</p>
+            <div class="insight-card__actions">
+                <button type="button" class="btn-secondary" onclick="refreshAudiencePreview()">Refresh preview</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- EVENT -->
+    <div class="field">
+        <div class="field-label">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+            </svg>
+            Event
+        </div>
+        <div class="events">
+            <div class="event-card" onclick="selectEvent('sent')" id="sent" role="button" tabindex="0">
+                <span class="check-corner" aria-hidden="true">✓</span>
+                <div class="ev-icon" aria-hidden="true">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
+                    </svg>
+                </div>
+                <span class="ev-label">Sent</span>
+            </div>
+            <div class="event-card" onclick="selectEvent('delivered')" id="delivered" role="button" tabindex="0">
+                <span class="check-corner" aria-hidden="true">✓</span>
+                <div class="ev-icon" aria-hidden="true">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <circle cx="12" cy="12" r="10" />
+                        <path d="M8 12l2.5 2.5L16 9" />
+                    </svg>
+                </div>
+                <span class="ev-label">Delivered</span>
+            </div>
+            <div class="event-card" onclick="selectEvent('failed')" id="failed" role="button" tabindex="0">
+                <span class="check-corner" aria-hidden="true">✓</span>
+                <div class="ev-icon" aria-hidden="true">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10" />
+                        <path d="M15 9l-6 6M9 9l6 6" />
+                    </svg>
+                </div>
+                <span class="ev-label">Failed</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- DAYS -->
+    <div class="field">
+        <div class="field-label">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+                <path d="M16 2v4M8 2v4M3 10h18" />
+            </svg>
+            Days
+        </div>
+        <input type="number" id="days" class="field-input" value="7" min="1" aria-label="Days" placeholder="e.g. 7" />
+    </div>
+
+    <!-- TEMPLATE -->
+    <div id="template_box" style="display:none;">
+        <div class="field">
+            <label for="templates">Templates</label>
+            <div class="template-toolbar">
+                <span class="template-toolbar__label">Failed-send templates in this window</span>
+                <button type="button" class="btn-link" onclick="selectAllTemplates()">Select all templates</button>
+                <button type="button" class="btn-link" onclick="clearTemplates()">Clear selection</button>
+            </div>
+            <select id="templates" class="select-like" multiple style="height:120px;"></select>
+        </div>
+    </div>
+
+    <!-- OTHER INPUTS -->
+    <div class="field">
+        <div class="field-label">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path d="M6 2L3 6v14a2 2 0 002 2h14a2 2 0 002-2V6l-3-4z" />
+                <path d="M3 6h18M16 10a4 4 0 01-8 0" />
+            </svg>
+            Purchase filter
+        </div>
+        <input type="number" id="purchase_days" class="field-input" value="360" placeholder="Purchase Days" />
+    </div>
+
+    <div class="field">
+        <div class="field-label">Daily target</div>
+        <input type="number" id="daily_target" class="field-input" value="1000" placeholder="Daily Target" />
+    </div>
+
+    <section class="preview-section" aria-labelledby="preview-heading">
+        <div class="preview-section__head">
+            <h2 id="preview-heading" class="preview-section__title">Preview · first 50 users</h2>
+            <span class="preview-section__meta" id="preview-meta"></span>
+        </div>
+        <div class="table-wrap" id="preview-table-wrap" hidden>
+            <table class="preview-table" id="preview-table">
+                <thead id="preview-thead"></thead>
+                <tbody id="preview-tbody"></tbody>
+            </table>
+        </div>
+        <p class="preview-empty" id="preview-empty">Loading preview…</p>
+    </section>
+
+    <div class="export-block">
+        <button type="button" class="btn-primary" onclick="exportCSV()">Export CSV</button>
+        <div id="status"></div>
+    </div>
+
 </div>
 
 <script>
 
-const BASE_URL = "https://dashboard.render.com/web/srv-d7iionfavr4c73fo9epg/deploys/dep-d7iionnavr4c73fo9f50?r=2026-04-19%4019%3A25%3A22%7E2026-04-19%4019%3A27%3A27";  // 👈 CHANGE THIS
+const BASE_URL = "https://comms-automation.onrender.com";  // ✅ FIXED
 
-function toggleTemplates() {
-    const eventType = document.getElementById("event_type").value;
-    document.getElementById("template_box").style.display =
-        (eventType === "failed") ? "block" : "none";
+let selectedEvent = "delivered";
+let previewTimer = null;
+
+function buildPayload() {
+    const selected_templates = Array.from(
+        document.getElementById("templates").selectedOptions
+    ).map(o => o.value);
+
+    return {
+        event_type: selectedEvent,
+        days: parseInt(document.getElementById("days").value, 10),
+        purchase_days: parseInt(document.getElementById("purchase_days").value, 10),
+        daily_target: parseInt(document.getElementById("daily_target").value, 10),
+        selected_templates
+    };
 }
 
-async function exportCSV() {
+function humanizeColumn(key) {
+    const map = {
+        email: "Email",
+        customer_id: "Customer ID",
+        pet_name: "Pet name",
+        final_phone: "Phone",
+        comms_label: "Comms label",
+        comms_cohort: "Cohort",
+        product_name: "Product"
+    };
+    if (map[key]) return map[key];
+    return key.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+}
 
+function renderPreviewTable(rows) {
+    const thead = document.getElementById("preview-thead");
+    const tbody = document.getElementById("preview-tbody");
+    const wrap = document.getElementById("preview-table-wrap");
+    const empty = document.getElementById("preview-empty");
+    thead.innerHTML = "";
+    tbody.innerHTML = "";
+
+    if (!rows || rows.length === 0) {
+        wrap.hidden = true;
+        empty.style.display = "block";
+        empty.textContent = "No users match this audience with the current filters.";
+        return;
+    }
+
+    wrap.hidden = false;
+    empty.style.display = "none";
+
+    const keys = Object.keys(rows[0]);
+    const hr = document.createElement("tr");
+    keys.forEach(k => {
+        const th = document.createElement("th");
+        th.textContent = humanizeColumn(k);
+        hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+
+    rows.forEach(row => {
+        const tr = document.createElement("tr");
+        keys.forEach(k => {
+            const td = document.createElement("td");
+            const v = row[k];
+            td.textContent = v === null || v === undefined ? "—" : String(v);
+            tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+    });
+}
+
+async function refreshAudiencePreview() {
+    const countEl = document.getElementById("audience-count");
+    const meta = document.getElementById("preview-meta");
+    const empty = document.getElementById("preview-empty");
+    const wrap = document.getElementById("preview-table-wrap");
+
+    countEl.textContent = "…";
+    meta.textContent = "Updating preview…";
+    wrap.hidden = true;
+    empty.style.display = "block";
+    empty.textContent = "Crunching your audience (same job as export)…";
+
+    try {
+        const res = await fetch(`${BASE_URL}/audience-preview`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(buildPayload())
+        });
+
+        if (!res.ok) {
+            const t = await res.text();
+            throw new Error(t || res.statusText);
+        }
+
+        const data = await res.json();
+        const n = typeof data.count === "number" ? data.count : 0;
+        countEl.textContent = n.toLocaleString("en-IN");
+        meta.textContent = n === 0
+            ? "0 users in this slice"
+            : `Showing ${Math.min(50, (data.preview || []).length)} of ${n.toLocaleString("en-IN")} users`;
+        renderPreviewTable(data.preview || []);
+    } catch (err) {
+        console.error(err);
+        countEl.textContent = "—";
+        meta.textContent = "Connect to API v2 — deploy backend with /audience-preview";
+        wrap.hidden = true;
+        empty.style.display = "block";
+        empty.textContent = "Preview unavailable. Deploy the latest API (includes /audience-preview) or check your connection.";
+    }
+}
+
+function schedulePreviewRefresh() {
+    if (previewTimer) clearTimeout(previewTimer);
+    previewTimer = setTimeout(refreshAudiencePreview, 600);
+}
+
+function selectAllTemplates() {
+    const sel = document.getElementById("templates");
+    for (let i = 0; i < sel.options.length; i++) {
+        sel.options[i].selected = true;
+    }
+    schedulePreviewRefresh();
+}
+
+function clearTemplates() {
+    const sel = document.getElementById("templates");
+    for (let i = 0; i < sel.options.length; i++) {
+        sel.options[i].selected = false;
+    }
+    schedulePreviewRefresh();
+}
+
+// EVENT SELECT
+function selectEvent(type) {
+    selectedEvent = type;
+
+    document.querySelectorAll(".event-card").forEach(el => el.classList.remove("active"));
+    document.getElementById(type).classList.add("active");
+
+    if (type === "failed") {
+        document.getElementById("template_box").style.display = "block";
+        loadTemplates();
+    } else {
+        document.getElementById("template_box").style.display = "none";
+    }
+    schedulePreviewRefresh();
+}
+
+// LOAD TEMPLATES
+async function loadTemplates() {
+    const days = document.getElementById("days").value;
+
+    try {
+        const res = await fetch(`${BASE_URL}/get-templates?days=${days}`);
+        const data = await res.json();
+
+        const dropdown = document.getElementById("templates");
+        dropdown.innerHTML = "";
+
+        data.templates.forEach(t => {
+            const option = document.createElement("option");
+            option.value = t;
+            option.text = t;
+            dropdown.appendChild(option);
+        });
+
+    } catch (err) {
+        console.error(err);
+    }
+    schedulePreviewRefresh();
+}
+
+// EXPORT
+async function exportCSV() {
     const status = document.getElementById("status");
     status.innerText = "Processing...";
 
-    const payload = {
-        event_type: document.getElementById("event_type").value,
-        days: parseInt(document.getElementById("days").value),
-        purchase_days: parseInt(document.getElementById("purchase_days").value),
-        daily_target: parseInt(document.getElementById("daily_target").value),
-        selected_templates: []
-    };
-
-    // handle templates
-    const rawTemplates = document.getElementById("templates").value;
-    if (payload.event_type === "failed" && rawTemplates) {
-        payload.selected_templates = rawTemplates.split(",").map(x => x.trim());
-    }
-
     try {
-        const response = await fetch(`${BASE_URL}/export-csv`, {
+        const res = await fetch(`${BASE_URL}/export-csv`, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify(payload)
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(buildPayload())
         });
 
-        if (!response.ok) {
-            throw new Error("API failed");
-        }
-
-        const blob = await response.blob();
+        const blob = await res.blob();
         const url = window.URL.createObjectURL(blob);
 
         const a = document.createElement("a");
         a.href = url;
-        a.download = "comms_output.csv";
-        document.body.appendChild(a);
+        a.download = "comms.csv";
         a.click();
-        a.remove();
 
-        status.innerText = "✅ Download complete";
+        status.innerText = "✅ Done";
 
     } catch (err) {
-        status.innerText = "❌ Error: " + err.message;
+        status.innerText = "❌ Error";
     }
 }
+
+document.getElementById("days").addEventListener("input", function () {
+    if (selectedEvent === "failed") {
+        loadTemplates();
+    } else {
+        schedulePreviewRefresh();
+    }
+});
+
+["purchase_days", "daily_target"].forEach(id => {
+    document.getElementById(id).addEventListener("input", schedulePreviewRefresh);
+});
+
+document.getElementById("templates").addEventListener("change", schedulePreviewRefresh);
+
+// default selection
+selectEvent("delivered");
+if (previewTimer) clearTimeout(previewTimer);
+refreshAudiencePreview();
 
 </script>
 
