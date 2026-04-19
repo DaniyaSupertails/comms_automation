@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Literal
 
@@ -375,6 +376,30 @@ def merge_eligible_with_comms(eligible: pd.DataFrame, comms: pd.DataFrame) -> pd
 # ---------------------------------------------------------------------------
 # Step 2: Signals + customer map (BQ + MySQL)
 # ---------------------------------------------------------------------------
+def _normalize_customer_id(val) -> str:
+    """
+    BigQuery often returns numeric customer_id; str(float) becomes '12345.0' while MySQL uses '12345'.
+    Without this, merge with cx_identifier fails and signals lose all emails → broken / empty audience.
+    """
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return ""
+    try:
+        if isinstance(val, (int, np.integer)):
+            return str(int(val))
+        if isinstance(val, (float, np.floating)):
+            f = float(val)
+            if np.isnan(f):
+                return ""
+            if f == int(f):
+                return str(int(f))
+    except (TypeError, ValueError):
+        pass
+    s = str(val).strip()
+    if len(s) > 2 and s.endswith(".0") and s[:-2].lstrip("-").isdigit():
+        return s[:-2]
+    return s
+
+
 def get_signals(bq_client):
     query = """
     WITH recency AS (
@@ -411,7 +436,7 @@ def get_signals(bq_client):
     WHERE r.rn = 1 OR b.rn = 1
     """
     df = bq_client.query(query).to_dataframe()
-    df["customer_id"] = df["customer_id"].astype(str)
+    df["customer_id"] = df["customer_id"].map(_normalize_customer_id)
     return df
 
 
@@ -425,6 +450,32 @@ def get_customer_email_map(cnx):
     df["email"] = df["email"].str.strip().str.lower()
     df = df.dropna(subset=["email"]).drop_duplicates("customer_id")
     return df
+
+
+def _mysql_with_fresh_connection(fn):
+    """Run fn(cnx) on a new connection and close it (for parallel bootstrap)."""
+    cnx = get_db_connection()
+    try:
+        return fn(cnx)
+    finally:
+        cnx.close()
+
+
+def _parallel_load_signals_and_mysql(bq_client):
+    """
+    Run BigQuery signals + three independent MySQL reads in parallel.
+    Cuts wall-clock time vs sequential when DB/BQ are the bottleneck.
+    """
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        f_sig = ex.submit(get_signals, bq_client)
+        f_el = ex.submit(_mysql_with_fresh_connection, get_eligible_customers)
+        f_co = ex.submit(_mysql_with_fresh_connection, build_comms_collapsed)
+        f_cm = ex.submit(_mysql_with_fresh_connection, get_customer_email_map)
+        signals = f_sig.result()
+        eligible = f_el.result()
+        comms = f_co.result()
+        cust_map = f_cm.result()
+    return signals, eligible, comms, cust_map
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +850,20 @@ def enrich_final_payload(selected: pd.DataFrame, cnx) -> pd.DataFrame:
     return df
 
 
+def enrich_final_payload_light(selected: pd.DataFrame, cnx) -> pd.DataFrame:
+    """
+    Faster path for /audience-preview only: skips heavy SKU / tags / delivery lookups.
+    Export still uses full enrich_final_payload.
+    """
+    df = selected.copy()
+    df = enrich_campaign_ids(df)
+    df = enrich_phone(df, cnx)
+    df = enrich_pet_name(df, cnx)
+    if "product_name" not in df.columns:
+        df["product_name"] = "your pet's favourite"
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -825,30 +890,45 @@ def _preview_rows_from_df(df: pd.DataFrame, limit: int = 50) -> tuple[int, list[
     return n, records
 
 
-def run_pipeline(req: AudienceRequest, cnx, bq) -> pd.DataFrame:
-    eligible = get_eligible_customers(cnx)
-    comms = build_comms_collapsed(cnx)
+def run_pipeline(req: AudienceRequest, cnx, bq, *, preview: bool = False) -> pd.DataFrame:
+    parallel = os.getenv("PIPELINE_PARALLEL_BOOTSTRAP", "1").lower() in ("1", "true", "yes")
+    if parallel:
+        signals, eligible, comms, cust_map = _parallel_load_signals_and_mysql(bq)
+    else:
+        eligible = get_eligible_customers(cnx)
+        comms = build_comms_collapsed(cnx)
+        signals = get_signals(bq)
+        cust_map = get_customer_email_map(cnx)
+
     df = merge_eligible_with_comms(eligible, comms)
 
-    signals = get_signals(bq)
-    cust_map = get_customer_email_map(cnx)
     signals = signals.merge(cust_map, on="customer_id", how="left")
     signals = signals.dropna(subset=["email"]).drop_duplicates("email")
 
-    df = df.merge(
-        signals[["email", "recency_category", "behavior_category"]],
-        on="email",
-        how="left",
-        validate="one_to_one",
-    )
+    if signals.empty:
+        logger.warning(
+            "No BQ signals matched cx_identifier emails after customer_id join — "
+            "recency/behavior will be empty; check _normalize_customer_id / BQ data."
+        )
+        df = df.copy()
+        df["recency_category"] = np.nan
+        df["behavior_category"] = np.nan
+    else:
+        df = df.merge(
+            signals[["email", "recency_category", "behavior_category"]],
+            on="email",
+            how="left",
+            validate="one_to_one",
+        )
 
     df = apply_comms_logic(df)
     df = enrich_monthly_customer_cohort(df, cnx)
     df = apply_comms_filter(df, req, cnx)
     df = apply_purchase_filter(df, req, cnx)
     df = apply_daily_target(df, req)
-    df = enrich_final_payload(df, cnx)
-    return df
+    if preview:
+        return enrich_final_payload_light(df, cnx)
+    return enrich_final_payload(df, cnx)
 
 
 # ---------------------------------------------------------------------------
@@ -919,7 +999,7 @@ def audience_preview(req: AudienceRequest):
     try:
         cnx = get_db_connection()
         bq = get_bq_client()
-        df = run_pipeline(req, cnx, bq)
+        df = run_pipeline(req, cnx, bq, preview=True)
         count, rows = _preview_rows_from_df(df, limit=50)
         return {"count": count, "preview": rows}
     except HTTPException:
@@ -946,13 +1026,23 @@ def export_csv(req: AudienceRequest):
             req.daily_target,
         )
         df = run_pipeline(req, cnx, bq)
+        n = len(df)
+        logger.info("export-csv finished rows=%s cols=%s", n, len(df.columns))
+        if n == 0:
+            logger.warning(
+                "export-csv: 0 rows — common causes: purchase filter window too tight, "
+                "Telle exclusions removed everyone, or daily_target cohorts empty."
+            )
         buf = io.StringIO()
         df.to_csv(buf, index=False)
         buf.seek(0)
         return StreamingResponse(
             buf,
             media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=comms_output.csv"},
+            headers={
+                "Content-Disposition": "attachment; filename=comms_output.csv",
+                "X-Export-Row-Count": str(n),
+            },
         )
     except HTTPException:
         raise
