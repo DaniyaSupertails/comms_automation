@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from google.cloud import bigquery
 from google.oauth2 import service_account
 from pydantic import BaseModel, Field
@@ -788,9 +788,32 @@ def run_pipeline(req: AudienceRequest, cnx, bq) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
-@app.get("/")
-def home():
+def _path_to_index_html() -> str | None:
+    """Same directory as app.py (Render layout), then static/index.html fallback."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in ("index.html", os.path.join("static", "index.html")):
+        p = os.path.join(base, name)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+@app.get("/health")
+def health():
+    """JSON health check for Render / uptime monitors."""
     return {"status": "running"}
+
+
+@app.get("/")
+def serve_ui():
+    """Serve the Comms Base Builder UI (index.html next to app.py, or static/index.html)."""
+    path = _path_to_index_html()
+    if path:
+        return FileResponse(path, media_type="text/html")
+    return {
+        "status": "running",
+        "hint": "Place index.html next to app.py (or static/index.html). GET /health for JSON.",
+    }
 
 
 @app.get("/get-templates")
