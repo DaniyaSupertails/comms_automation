@@ -56,6 +56,10 @@ _BQ_SERVICE_ACCOUNT_PUBLIC: dict[str, str] = {
 }
 
 
+def _is_truthy_env(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _bq_private_key_from_env() -> str:
     """Render often stores PEM with literal \\n — normalize to real newlines."""
     raw = (os.getenv("BQ_PRIVATE_KEY") or os.getenv("GOOGLE_PRIVATE_KEY") or "").strip()
@@ -241,20 +245,34 @@ IN_CHUNK_SIZE = int(os.getenv("SQL_IN_CHUNK_SIZE", "3000"))
 # ---------------------------------------------------------------------------
 # DB / BQ
 # ---------------------------------------------------------------------------
+def _resolve_db_host_and_port(raw_host: str, raw_port: str) -> tuple[str, int]:
+    host = raw_host.strip()
+    port = int((raw_port or "3306").strip())
+    if host.count(":") == 1:
+        maybe_host, maybe_port = host.rsplit(":", 1)
+        if maybe_port.isdigit():
+            host = maybe_host.strip()
+            port = int(maybe_port)
+    return host, port
+
+
 def get_db_connection():
     """
     MySQL must be reachable from the Render host. Use your cloud DB hostname in DB_HOST
     (not localhost — on Render there is no MySQL on localhost unless you add a private service).
     """
-    host = (os.getenv("DB_HOST") or "").strip()
+    raw_host = os.getenv("DB_HOST") or ""
+    raw_port = os.getenv("DB_PORT") or ""
     user = (os.getenv("DB_USER") or "").strip()
     password = os.getenv("DB_PASSWORD") or ""
     database = (os.getenv("DB_NAME") or "").strip()
+    host, port = _resolve_db_host_and_port(raw_host, raw_port)
     if not host or not user or not database:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Database not configured: set DB_HOST, DB_USER, DB_PASSWORD, and DB_NAME "
+                "Database not configured: set DB_HOST, DB_USER, DB_PASSWORD, DB_NAME "
+                "(and DB_PORT if needed) "
                 "in Render Environment. Use your managed MySQL hostname (e.g. AWS RDS, "
                 "PlanetScale, or Render Private Service), not localhost."
             ),
@@ -266,13 +284,25 @@ def get_db_connection():
             host,
         )
     try:
-        return sql.connect(
-            host=host,
-            user=user,
-            password=password,
-            database=database,
-            connection_timeout=10,
-        )
+        connect_kwargs = {
+            "host": host,
+            "port": port,
+            "user": user,
+            "password": password,
+            "database": database,
+            "connection_timeout": int((os.getenv("DB_CONNECT_TIMEOUT") or "15").strip()),
+            "autocommit": True,
+        }
+        if _is_truthy_env("DB_SSL_DISABLED"):
+            connect_kwargs["ssl_disabled"] = True
+        ssl_ca = (os.getenv("DB_SSL_CA") or "").strip()
+        if ssl_ca:
+            connect_kwargs["ssl_ca"] = ssl_ca
+        if _is_truthy_env("DB_SSL_VERIFY_CERT"):
+            connect_kwargs["ssl_verify_cert"] = True
+        if _is_truthy_env("DB_SSL_VERIFY_IDENTITY"):
+            connect_kwargs["ssl_verify_identity"] = True
+        return sql.connect(**connect_kwargs)
     except Exception as e:
         logger.exception("MySQL connection failed")
         raise HTTPException(status_code=500, detail=f"DB connection failed: {e!s}") from e
@@ -310,6 +340,60 @@ def http_detail(exc: BaseException) -> str:
     if os.getenv("SHOW_ERROR_DETAILS", "").lower() in ("1", "true", "yes"):
         return str(exc)
     return "Internal server error"
+
+
+def _dependency_health_details() -> dict[str, object]:
+    missing_env = [
+        key
+        for key in (
+            "DB_HOST",
+            "DB_USER",
+            "DB_PASSWORD",
+            "DB_NAME",
+            "BQ_PRIVATE_KEY",
+            "BQ_PRIVATE_KEY_ID",
+        )
+        if not (os.getenv(key) or "").strip()
+    ]
+    details: dict[str, object] = {
+        "status": "ok",
+        "missing_env": missing_env,
+        "database": {"status": "unknown"},
+        "bigquery": {"status": "unknown"},
+    }
+
+    cnx = None
+    try:
+        cnx = get_db_connection()
+        cur = cnx.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        details["database"] = {"status": "ok"}
+    except HTTPException as exc:
+        details["status"] = "error"
+        details["database"] = {"status": "error", "detail": str(exc.detail)}
+    except Exception as exc:
+        details["status"] = "error"
+        details["database"] = {"status": "error", "detail": str(exc)}
+    finally:
+        if cnx is not None:
+            cnx.close()
+
+    try:
+        bq = get_bq_client()
+        list(bq.query("SELECT 1 AS ok").result(max_results=1))
+        details["bigquery"] = {"status": "ok"}
+    except HTTPException as exc:
+        details["status"] = "error"
+        details["bigquery"] = {"status": "error", "detail": str(exc.detail)}
+    except Exception as exc:
+        details["status"] = "error"
+        details["bigquery"] = {"status": "error", "detail": str(exc)}
+
+    if missing_env:
+        details["status"] = "error"
+    return details
 
 
 # ---------------------------------------------------------------------------
@@ -872,9 +956,11 @@ def run_pipeline(req: AudienceRequest, cnx, bq, *, preview: bool = False) -> pd.
         cust_map = get_customer_email_map(cnx)
 
     df = merge_eligible_with_comms(eligible, comms)
+    logger.info("pipeline rows after eligible+comms merge=%s", len(df))
 
     signals = signals.merge(cust_map, on="customer_id", how="left")
     signals = signals.dropna(subset=["email"]).drop_duplicates("email")
+    logger.info("pipeline signal rows after customer/email join=%s", len(signals))
 
     if signals.empty:
         logger.warning(
@@ -893,10 +979,15 @@ def run_pipeline(req: AudienceRequest, cnx, bq, *, preview: bool = False) -> pd.
         )
 
     df = apply_comms_logic(df)
+    logger.info("pipeline rows after comms logic=%s", len(df))
     df = enrich_monthly_customer_cohort(df, cnx)
+    logger.info("pipeline rows after monthly cohort=%s", len(df))
     df = apply_comms_filter(df, req, cnx)
+    logger.info("pipeline rows after comms filter=%s", len(df))
     df = apply_purchase_filter(df, req, cnx)
+    logger.info("pipeline rows after purchase filter=%s", len(df))
     df = apply_daily_target(df, req)
+    logger.info("pipeline rows after daily target=%s", len(df))
     if preview:
         return enrich_final_payload_light(df, cnx)
     return enrich_final_payload(df, cnx)
@@ -919,6 +1010,12 @@ def _path_to_index_html() -> str | None:
 def health():
     """JSON health check for Render / uptime monitors."""
     return {"status": "running"}
+
+
+@app.get("/dependency-health")
+def dependency_health():
+    """Lightweight dependency checks so the frontend can show a real failure reason."""
+    return _dependency_health_details()
 
 
 @app.get("/")
