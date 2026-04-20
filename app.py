@@ -436,7 +436,12 @@ def get_signals(bq_client):
         ON r.customer_id = b.customer_id
     WHERE r.rn = 1 OR b.rn = 1
     """
-    df = bq_client.query(query).to_dataframe()
+    try:
+        # Faster when google-cloud-bigquery-storage + pyarrow are installed
+        df = bq_client.query(query).to_dataframe(create_bqstorage_client=True)
+    except Exception:
+        logger.info("BQ Storage API path failed; retrying default to_dataframe()")
+        df = bq_client.query(query).to_dataframe()
     df["customer_id"] = df["customer_id"].map(_normalize_customer_id)
     return df
 
@@ -709,41 +714,71 @@ def enrich_product_urls(df: pd.DataFrame, cnx) -> pd.DataFrame:
     return final_df.drop(columns=["comms_cohort_clean"], errors="ignore")
 
 
-def enrich_coupon_and_bank(df: pd.DataFrame, cnx) -> pd.DataFrame:
+def enrich_shopify_coupon_tags(df: pd.DataFrame, cnx) -> pd.DataFrame:
     final_df = df.copy()
     customer_ids = final_df["customer_id"].astype(str).unique().tolist()
-
-    if customer_ids:
-        placeholders = ",".join(["%s"] * len(customer_ids))
-        tags_q = f"""
-            SELECT customer_id, tags
-            FROM shopifyBase.shopify_customers
-            WHERE customer_id IN ({placeholders})
-        """
-        tags_df = pd.read_sql(tags_q, cnx, params=customer_ids)
-        tags_df["coupon"] = np.select(
-            [
-                tags_df["tags"].str.contains("Order_Count:1", na=False),
-                tags_df["tags"].str.contains("Order_Count:2", na=False),
-                tags_df["tags"].str.contains("LOD:90Days", na=False),
-            ],
-            ["STSECOND", "STTHIRD", "MISSEDYOU"],
-            default="SAVE100",
-        )
-        final_df = final_df.merge(tags_df[["customer_id", "coupon"]], on="customer_id", how="left")
-
-        issuer_q = f"""
-            SELECT id.customer_id, cx.payment_card_issuer
-            FROM cx_identifier id
-            LEFT JOIN cx_profile_attributes cx ON id.customer_id = cx.customer_id
-            WHERE id.customer_id IN ({placeholders})
-        """
-        issuer_df = pd.read_sql(issuer_q, cnx, params=customer_ids)
-        issuer_df["customer_id"] = issuer_df["customer_id"].astype(str)
-        final_df = final_df.merge(issuer_df, on="customer_id", how="left")
-    else:
+    if not customer_ids:
         final_df["coupon"] = "SAVE100"
+        return final_df
+    placeholders = ",".join(["%s"] * len(customer_ids))
+    tags_q = f"""
+        SELECT customer_id, tags
+        FROM shopifyBase.shopify_customers
+        WHERE customer_id IN ({placeholders})
+    """
+    tags_df = pd.read_sql(tags_q, cnx, params=customer_ids)
+    tags_df["coupon"] = np.select(
+        [
+            tags_df["tags"].str.contains("Order_Count:1", na=False),
+            tags_df["tags"].str.contains("Order_Count:2", na=False),
+            tags_df["tags"].str.contains("LOD:90Days", na=False),
+        ],
+        ["STSECOND", "STTHIRD", "MISSEDYOU"],
+        default="SAVE100",
+    )
+    return final_df.merge(tags_df[["customer_id", "coupon"]], on="customer_id", how="left")
 
+
+def enrich_cx_customer_bundle(df: pd.DataFrame, cnx) -> pd.DataFrame:
+    """Single MySQL query: phone, delivery copy, pet name, card issuer (replaces 4 round-trips)."""
+    final_df = df.copy()
+    customer_ids = final_df["customer_id"].astype(str).unique().tolist()
+    if not customer_ids:
+        final_df["final_phone"] = np.nan
+        final_df["copy_3"] = "at your doorstep"
+        final_df["payment_card_issuer"] = np.nan
+        final_df["pet_name"] = "your pet"
+        return final_df
+
+    placeholders = ",".join(["%s"] * len(customer_ids))
+    query = f"""
+        SELECT
+            id.customer_id,
+            COALESCE(id.clevertap_phone, id.phone) AS final_phone,
+            id.delivery_flag,
+            cx.payment_card_issuer,
+            pp.pet_name
+        FROM cx_identifier id
+        LEFT JOIN cx_profile_attributes cx ON id.customer_id = cx.customer_id
+        LEFT JOIN cx_pet_profile pp
+            ON id.customer_id = pp.customer_id AND pp.pet_number = 1
+        WHERE id.customer_id IN ({placeholders})
+    """
+    meta = pd.read_sql(query, cnx, params=customer_ids)
+    meta["customer_id"] = meta["customer_id"].astype(str)
+    out = final_df.merge(meta, on="customer_id", how="left")
+    out["pet_name"] = out["pet_name"].fillna("your pet")
+
+    valid = out["delivery_flag"].isin(["120_min", "30_min", "same_day", "next_day"])
+    out["copy_3"] = np.where(
+        valid & out["delivery_flag"].notna(),
+        out["delivery_flag"].map(DELIVERY_COPY_MAP),
+        "at your doorstep",
+    )
+    return out.drop(columns=["delivery_flag"], errors="ignore")
+
+
+def _apply_coupon_discount_bank_copy_2(final_df: pd.DataFrame) -> pd.DataFrame:
     final_df["coupon"] = final_df["coupon"].fillna("SAVE100")
     final_df["coupon_discount"] = final_df["coupon"].map(DISCOUNT_MAP).fillna("100 OFF")
 
@@ -774,92 +809,27 @@ def enrich_coupon_and_bank(df: pd.DataFrame, cnx) -> pd.DataFrame:
     return final_df
 
 
-def enrich_delivery(df: pd.DataFrame, cnx) -> pd.DataFrame:
-    final_df = df.copy()
-    customer_ids = final_df["customer_id"].astype(str).unique().tolist()
-    if not customer_ids:
-        final_df["copy_3"] = "at your doorstep"
-        return final_df
-
-    placeholders = ",".join(["%s"] * len(customer_ids))
-    query = f"""
-        SELECT customer_id, delivery_flag
-        FROM cx_identifier
-        WHERE customer_id IN ({placeholders})
-          AND delivery_flag IN ('120_min', '30_min', 'same_day', 'next_day')
-    """
-    edd = pd.read_sql(query, cnx, params=customer_ids)
-    edd["customer_id"] = edd["customer_id"].astype(str)
-    edd["copy_3"] = edd["delivery_flag"].map(DELIVERY_COPY_MAP)
-    out = final_df.merge(edd[["customer_id", "copy_3"]], on="customer_id", how="left")
-    out["copy_3"] = out["copy_3"].fillna("at your doorstep")
-    return out
-
-
 def enrich_campaign_ids(df: pd.DataFrame) -> pd.DataFrame:
     out = assign_comms_cohort1(df)
     out["campaign_id"] = out["comms_cohort1"].map(CAMPAIGN_MAP)
     return out
 
 
-def enrich_phone(df: pd.DataFrame, cnx) -> pd.DataFrame:
-    customer_ids = df["customer_id"].astype(str).unique().tolist()
-    if not customer_ids:
-        df["final_phone"] = np.nan
-        return df
-
-    placeholders = ",".join(["%s"] * len(customer_ids))
-    query = f"""
-        SELECT customer_id,
-               COALESCE(clevertap_phone, phone) AS final_phone
-        FROM cx_identifier
-        WHERE customer_id IN ({placeholders})
-    """
-    phones = pd.read_sql(query, cnx, params=customer_ids)
-    phones["customer_id"] = phones["customer_id"].astype(str)
-    return df.merge(phones, on="customer_id", how="left")
-
-
-def enrich_pet_name(df: pd.DataFrame, cnx) -> pd.DataFrame:
-    customer_ids = df["customer_id"].astype(str).unique().tolist()
-    if not customer_ids:
-        df["pet_name"] = "your pet"
-        return df
-
-    placeholders = ",".join(["%s"] * len(customer_ids))
-    query = f"""
-        SELECT customer_id, pet_name
-        FROM cx_pet_profile
-        WHERE customer_id IN ({placeholders})
-          AND pet_number = 1
-    """
-    pets = pd.read_sql(query, cnx, params=customer_ids)
-    pets["customer_id"] = pets["customer_id"].astype(str)
-    out = df.merge(pets, on="customer_id", how="left")
-    out["pet_name"] = out["pet_name"].fillna("your pet")
-    return out
-
-
 def enrich_final_payload(selected: pd.DataFrame, cnx) -> pd.DataFrame:
     df = selected.copy()
     df = enrich_product_urls(df, cnx)
-    df = enrich_coupon_and_bank(df, cnx)
-    df = enrich_delivery(df, cnx)
+    df = enrich_shopify_coupon_tags(df, cnx)
+    df = enrich_cx_customer_bundle(df, cnx)
+    df = _apply_coupon_discount_bank_copy_2(df)
     df = enrich_campaign_ids(df)
-    df = enrich_phone(df, cnx)
-    df = enrich_pet_name(df, cnx)
     return df
 
 
 def enrich_final_payload_light(selected: pd.DataFrame, cnx) -> pd.DataFrame:
-    """
-    Faster path for /audience-preview only: skips heavy SKU / tags / delivery lookups.
-    Export still uses full enrich_final_payload.
-    """
+    """Preview path: no SKU / Shopify tags; one cx bundle for phone + pet."""
     df = selected.copy()
     df = enrich_campaign_ids(df)
-    df = enrich_phone(df, cnx)
-    df = enrich_pet_name(df, cnx)
+    df = enrich_cx_customer_bundle(df, cnx)
     if "product_name" not in df.columns:
         df["product_name"] = "your pet's favourite"
     return df
