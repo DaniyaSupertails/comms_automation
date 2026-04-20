@@ -240,6 +240,7 @@ DELIVERY_COPY_MAP = {
 FALLBACK_PRODUCT_COHORTS = {"Recency", "Behavior", "Generic"}
 
 IN_CHUNK_SIZE = int(os.getenv("SQL_IN_CHUNK_SIZE", "3000"))
+BQ_CUSTOMER_CHUNK_SIZE = int(os.getenv("BQ_CUSTOMER_CHUNK_SIZE", "8000"))
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +401,7 @@ def _dependency_health_details() -> dict[str, object]:
 # Step 0: Eligible base (DOA filter) — notebook cx_identifier + profile
 # ---------------------------------------------------------------------------
 def get_eligible_customers(cnx) -> pd.DataFrame:
-    query = """
+    query = f"""
         SELECT id.customer_id, id.email
         FROM cx_identifier id
         LEFT JOIN cx_profile_attributes cx ON id.customer_id = cx.customer_id
@@ -485,49 +486,138 @@ def _normalize_customer_id(val) -> str:
     return s
 
 
-def get_signals(bq_client):
+def normalize_email(s):
+    if pd.isna(s):
+        return None
+    return str(s).strip().lower()
+
+
+def _get_signal_scores_chunk(
+    bq_client, customer_ids: list[str], *, score_column: str, out_column: str
+) -> pd.DataFrame:
     query = """
-    WITH recency AS (
-        SELECT
-            customer_id,
-            ah_category AS recency_category,
-            ROW_NUMBER() OVER (
-                PARTITION BY customer_id
-                ORDER BY recency_score DESC
-            ) AS rn
-        FROM `ga4-data-api-1681899023728.cx_signal_final.cx_signal_ah`
-        WHERE ah_category NOT IN ('CLINIC & AHS', 'OTHERS')
-          AND recency_score IS NOT NULL
-    ),
-    behavior AS (
-        SELECT
-            customer_id,
-            ah_category AS behavior_category,
-            ROW_NUMBER() OVER (
-                PARTITION BY customer_id
-                ORDER BY behavior_score DESC
-            ) AS rn
-        FROM `ga4-data-api-1681899023728.cx_signal_final.cx_signal_ah`
-        WHERE ah_category NOT IN ('CLINIC & AHS', 'OTHERS')
-          AND behavior_score IS NOT NULL
+    WITH target_customers AS (
+        SELECT customer_id
+        FROM UNNEST(@customer_ids) AS customer_id
     )
     SELECT
-        COALESCE(r.customer_id, b.customer_id) AS customer_id,
-        r.recency_category,
-        b.behavior_category
-    FROM recency r
-    FULL OUTER JOIN behavior b
-        ON r.customer_id = b.customer_id
-    WHERE r.rn = 1 OR b.rn = 1
+        CAST(src.customer_id AS STRING) AS customer_id,
+        src.ah_category,
+        src.score_value
+    FROM (
+        SELECT
+            CAST(src.customer_id AS STRING) AS customer_id,
+            src.ah_category,
+            src.{score_column} AS score_value,
+            ROW_NUMBER() OVER (
+                PARTITION BY CAST(src.customer_id AS STRING)
+                ORDER BY src.{score_column} DESC
+            ) AS rn
+        FROM `ga4-data-api-1681899023728.cx_signal_final.cx_signal_ah` src
+        INNER JOIN target_customers t
+            ON CAST(src.customer_id AS STRING) = t.customer_id
+        WHERE src.ah_category NOT IN ('CLINIC & AHS', 'OTHERS')
+          AND src.{score_column} IS NOT NULL
+    ) src
+    WHERE src.rn = 1
     """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("customer_ids", "STRING", customer_ids)
+        ]
+    )
     try:
-        # Faster when google-cloud-bigquery-storage + pyarrow are installed
-        df = bq_client.query(query).to_dataframe(create_bqstorage_client=True)
+        df = bq_client.query(query, job_config=job_config).to_dataframe(
+            create_bqstorage_client=True
+        )
     except Exception:
         logger.info("BQ Storage API path failed; retrying default to_dataframe()")
-        df = bq_client.query(query).to_dataframe()
+        df = bq_client.query(query, job_config=job_config).to_dataframe()
+    if df.empty:
+        return pd.DataFrame(columns=["customer_id", out_column, score_column])
     df["customer_id"] = df["customer_id"].map(_normalize_customer_id)
-    return df
+    return df.rename(columns={"ah_category": out_column, "score_value": score_column})
+
+
+def _build_signal_table(
+    raw_df: pd.DataFrame, cust_map: pd.DataFrame, *, score_column: str, out_column: str
+) -> pd.DataFrame:
+    if raw_df.empty:
+        return pd.DataFrame(columns=["email", out_column])
+    merged = raw_df.merge(
+        cust_map[["customer_id", "email"]],
+        on="customer_id",
+        how="left",
+        validate="many_to_one",
+    )
+    merged["email"] = merged["email"].apply(normalize_email)
+    signal_df = (
+        merged.sort_values(score_column, ascending=False)
+        .drop_duplicates("email", keep="first")
+        [["email", out_column]]
+        .dropna(subset=["email"])
+        .reset_index(drop=True)
+    )
+    if not signal_df["email"].is_unique:
+        raise ValueError(f"{out_column} emails are not unique")
+    return signal_df
+
+
+def get_signals(bq_client, cust_map: pd.DataFrame, customer_ids: list[str]) -> pd.DataFrame:
+    customer_ids = [cid for cid in map(_normalize_customer_id, customer_ids) if cid]
+    if not customer_ids:
+        return pd.DataFrame(columns=["email", "recency_category", "behavior_category"])
+
+    recent_frames = []
+    behavior_frames = []
+    for i in range(0, len(customer_ids), BQ_CUSTOMER_CHUNK_SIZE):
+        chunk = customer_ids[i : i + BQ_CUSTOMER_CHUNK_SIZE]
+        logger.info("BQ signal query chunk size=%s", len(chunk))
+        recent_frames.append(
+            _get_signal_scores_chunk(
+                bq_client,
+                chunk,
+                score_column="recency_score",
+                out_column="recency_category",
+            )
+        )
+        behavior_frames.append(
+            _get_signal_scores_chunk(
+                bq_client,
+                chunk,
+                score_column="behavior_score",
+                out_column="behavior_category",
+            )
+        )
+
+    recent_raw = pd.concat(recent_frames, ignore_index=True) if recent_frames else pd.DataFrame()
+    behavior_raw = (
+        pd.concat(behavior_frames, ignore_index=True) if behavior_frames else pd.DataFrame()
+    )
+
+    recent_signal = _build_signal_table(
+        recent_raw,
+        cust_map,
+        score_column="recency_score",
+        out_column="recency_category",
+    )
+    behavior_signal = _build_signal_table(
+        behavior_raw,
+        cust_map,
+        score_column="behavior_score",
+        out_column="behavior_category",
+    )
+
+    signals = recent_signal.merge(
+        behavior_signal,
+        on="email",
+        how="outer",
+        validate="one_to_one",
+    )
+    signals = signals.drop_duplicates().dropna(subset=["email"]).reset_index(drop=True)
+    if not signals.empty and not signals["email"].is_unique:
+        raise ValueError("Signals emails are not unique")
+    return signals
 
 
 def get_customer_email_map(cnx):
@@ -537,7 +627,7 @@ def get_customer_email_map(cnx):
     """
     df = pd.read_sql(query, cnx)
     df["customer_id"] = df["customer_id"].astype(str)
-    df["email"] = df["email"].str.strip().str.lower()
+    df["email"] = df["email"].apply(normalize_email)
     df = df.dropna(subset=["email"]).drop_duplicates("customer_id")
     return df
 
@@ -551,21 +641,16 @@ def _mysql_with_fresh_connection(fn):
         cnx.close()
 
 
-def _parallel_load_signals_and_mysql(bq_client):
-    """
-    Run BigQuery signals + three independent MySQL reads in parallel.
-    Cuts wall-clock time vs sequential when DB/BQ are the bottleneck.
-    """
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        f_sig = ex.submit(get_signals, bq_client)
+def _parallel_load_mysql_bootstrap():
+    """Notebook-aligned bootstrap: load base, comms, and customer/email map in parallel."""
+    with ThreadPoolExecutor(max_workers=3) as ex:
         f_el = ex.submit(_mysql_with_fresh_connection, get_eligible_customers)
         f_co = ex.submit(_mysql_with_fresh_connection, build_comms_collapsed)
         f_cm = ex.submit(_mysql_with_fresh_connection, get_customer_email_map)
-        signals = f_sig.result()
         eligible = f_el.result()
         comms = f_co.result()
         cust_map = f_cm.result()
-    return signals, eligible, comms, cust_map
+    return eligible, comms, cust_map
 
 
 # ---------------------------------------------------------------------------
@@ -948,31 +1033,33 @@ def _preview_rows_from_df(df: pd.DataFrame, limit: int = 50) -> tuple[int, list[
 def run_pipeline(req: AudienceRequest, cnx, bq, *, preview: bool = False) -> pd.DataFrame:
     parallel = os.getenv("PIPELINE_PARALLEL_BOOTSTRAP", "1").lower() in ("1", "true", "yes")
     if parallel:
-        signals, eligible, comms, cust_map = _parallel_load_signals_and_mysql(bq)
+        eligible, comms, cust_map = _parallel_load_mysql_bootstrap()
     else:
         eligible = get_eligible_customers(cnx)
         comms = build_comms_collapsed(cnx)
-        signals = get_signals(bq)
         cust_map = get_customer_email_map(cnx)
 
     df = merge_eligible_with_comms(eligible, comms)
     logger.info("pipeline rows after eligible+comms merge=%s", len(df))
 
-    signals = signals.merge(cust_map, on="customer_id", how="left")
-    signals = signals.dropna(subset=["email"]).drop_duplicates("email")
-    logger.info("pipeline signal rows after customer/email join=%s", len(signals))
+    signals = get_signals(
+        bq,
+        cust_map,
+        eligible["customer_id"].astype(str).unique().tolist(),
+    )
+    logger.info("pipeline signal rows after notebook-style signal build=%s", len(signals))
 
     if signals.empty:
         logger.warning(
-            "No BQ signals matched cx_identifier emails after customer_id join — "
-            "recency/behavior will be empty; check _normalize_customer_id / BQ data."
+            "No notebook-style BQ signals matched eligible customer emails; "
+            "recency/behavior will be empty."
         )
         df = df.copy()
         df["recency_category"] = np.nan
         df["behavior_category"] = np.nan
     else:
         df = df.merge(
-            signals[["email", "recency_category", "behavior_category"]],
+            signals[["email", "recency_category", "behavior_category"]].drop_duplicates("email"),
             on="email",
             how="left",
             validate="one_to_one",
