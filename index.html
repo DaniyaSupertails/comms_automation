@@ -790,8 +790,12 @@ async function refreshAudiencePreview() {
         });
 
         if (!res.ok) {
-            const t = await res.text();
-            throw new Error(t || res.statusText);
+            let detail = await res.text();
+            try {
+                const j = JSON.parse(detail);
+                if (j.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+            } catch (_) { /* keep text */ }
+            throw new Error(detail || res.statusText);
         }
 
         const data = await res.json();
@@ -804,10 +808,13 @@ async function refreshAudiencePreview() {
     } catch (err) {
         console.error(err);
         countEl.textContent = "—";
-        meta.textContent = "Connect to API v2 — deploy backend with /audience-preview";
+        meta.textContent = "Could not load preview";
         wrap.hidden = true;
         empty.style.display = "block";
-        empty.textContent = "Preview unavailable. Deploy the latest API (includes /audience-preview) or check your connection.";
+        const hint =
+            (err && err.message) ||
+            "Check Render logs. Set DB_* and BQ_CREDENTIALS_JSON (or BQ_CREDENTIALS_JSON_B64), then redeploy.";
+        empty.textContent = hint;
     }
 }
 
@@ -884,18 +891,44 @@ async function exportCSV() {
             body: JSON.stringify(buildPayload())
         });
 
+        const ct = (res.headers.get("content-type") || "").toLowerCase();
+        if (!res.ok) {
+            let msg = `Export failed (${res.status})`;
+            try {
+                const j = await res.json();
+                if (j.detail) msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+            } catch (_) {
+                msg = await res.text() || msg;
+            }
+            status.innerText = "❌ " + msg;
+            return;
+        }
+
+        if (ct.includes("application/json")) {
+            status.innerText =
+                "❌ Server returned JSON instead of CSV — check DB/BQ env vars on Render.";
+            return;
+        }
+
+        const rowCount = res.headers.get("X-Export-Row-Count");
         const blob = await res.blob();
-        const url = window.URL.createObjectURL(blob);
 
         const a = document.createElement("a");
-        a.href = url;
+        a.href = window.URL.createObjectURL(blob);
         a.download = "comms.csv";
         a.click();
 
-        status.innerText = "✅ Done";
+        if (rowCount === "0") {
+            status.innerText =
+                "⚠️ Saved file has 0 rows. Raise Purchase filter (days), widen Days, or pick another event — check Render logs.";
+        } else if (rowCount != null && rowCount !== "") {
+            status.innerText = "✅ Done — " + rowCount + " rows";
+        } else {
+            status.innerText = "✅ Done (redeploy API to show row count in status)";
+        }
 
     } catch (err) {
-        status.innerText = "❌ Error";
+        status.innerText = "❌ " + ((err && err.message) || "Network error");
     }
 }
 
