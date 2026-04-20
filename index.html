@@ -700,14 +700,9 @@
 const BASE_URL =
     window.location.protocol === "file:" ? "https://comms-automation.onrender.com" : "";
 
-/** Notebook-style runs can take ~15 minutes; only abort the browser request after 30 minutes. */
-const API_LONG_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
-function longRunningFetchSignal() {
-    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
-        return AbortSignal.timeout(API_LONG_REQUEST_TIMEOUT_MS);
-    }
-    return undefined;
-}
+/** API queues work and returns 202; we poll GET /jobs/{id} so the load balancer never holds one long connection. */
+const JOB_POLL_MS = 2000;
+const JOB_POLL_MAX_MS = 3 * 60 * 60 * 1000;
 
 let selectedEvent = "delivered";
 let previewTimer = null;
@@ -736,6 +731,26 @@ async function fetchDependencyHealth() {
     } catch (_) {
         return null;
     }
+}
+
+async function pollJobUntilDone(jobId, { label = "Job" } = {}) {
+    const start = Date.now();
+    while (Date.now() - start < JOB_POLL_MAX_MS) {
+        const res = await fetch(`${BASE_URL}/jobs/${encodeURIComponent(jobId)}`);
+        if (!res.ok) {
+            const detail = await getActionableError(res, `${label} status failed`);
+            throw new Error(detail);
+        }
+        const data = await res.json();
+        if (data.status === "done") return data;
+        if (data.status === "error") {
+            throw new Error(data.detail || `${label} failed`);
+        }
+        await new Promise(r => setTimeout(r, JOB_POLL_MS));
+    }
+    throw new Error(
+        `${label} still running after ${Math.round(JOB_POLL_MAX_MS / 60000)} minutes — check server logs.`
+    );
 }
 
 async function getActionableError(res, fallback) {
@@ -839,23 +854,28 @@ async function refreshAudiencePreview() {
     wrap.hidden = true;
     empty.style.display = "block";
     empty.textContent =
-        "Crunching your audience (same job as export). This can take 10–20+ minutes; the tab will wait up to 30 minutes.";
+        "Queued — building audience (same work as export). Can take many minutes; you can leave this tab open.";
 
     try {
-        const sig = longRunningFetchSignal();
         const res = await fetch(`${BASE_URL}/audience-preview`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(buildPayload()),
-            ...(sig ? { signal: sig } : {})
         });
 
-        if (!res.ok) {
-            const detail = await getActionableError(res, "Could not load preview");
-            throw new Error(detail || res.statusText);
+        if (res.status !== 202) {
+            if (!res.ok) {
+                const detail = await getActionableError(res, "Could not load preview");
+                throw new Error(detail || res.statusText);
+            }
+            throw new Error("Expected 202 from server — redeploy the API.");
         }
 
-        const data = await res.json();
+        const queued = await res.json();
+        const jobId = queued.job_id;
+        meta.textContent = "Building…";
+
+        const data = await pollJobUntilDone(jobId, { label: "Preview" });
         const n = typeof data.count === "number" ? data.count : 0;
         countEl.textContent = n.toLocaleString("en-IN");
         meta.textContent = n === 0
@@ -868,14 +888,9 @@ async function refreshAudiencePreview() {
         meta.textContent = "Could not load preview";
         wrap.hidden = true;
         empty.style.display = "block";
-        let hint =
+        empty.textContent =
             (err && err.message) ||
             "Could not load preview. Check database and BigQuery connectivity.";
-        if (err && err.name === "AbortError") {
-            hint =
-                "Preview took longer than 30 minutes and was cancelled. Raise Render request timeout or run a smaller daily target.";
-        }
-        empty.textContent = hint;
     }
 }
 
@@ -943,33 +958,40 @@ async function loadTemplates() {
 // EXPORT
 async function exportCSV() {
     const status = document.getElementById("status");
-    status.innerText = "Processing...";
+    status.innerText = "Queuing export…";
 
     try {
-        status.innerText = "Processing (may take 10–20+ minutes; times out only after 30 min)…";
-        const sig = longRunningFetchSignal();
         const res = await fetch(`${BASE_URL}/export-csv`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(buildPayload()),
-            ...(sig ? { signal: sig } : {})
         });
 
-        const ct = (res.headers.get("content-type") || "").toLowerCase();
-        if (!res.ok) {
-            const msg = await getActionableError(res, "Export failed");
+        if (res.status !== 202) {
+            if (!res.ok) {
+                const msg = await getActionableError(res, "Export failed");
+                status.innerText = "❌ " + msg;
+                return;
+            }
+            status.innerText = "❌ Expected 202 from server — redeploy the API.";
+            return;
+        }
+
+        const queued = await res.json();
+        const jobId = queued.job_id;
+        status.innerText = "Building CSV… (polling job status — no long single HTTP request)";
+
+        await pollJobUntilDone(jobId, { label: "Export" });
+
+        const dl = await fetch(`${BASE_URL}/jobs/${encodeURIComponent(jobId)}/download`);
+        if (!dl.ok) {
+            const msg = await getActionableError(dl, "Download failed");
             status.innerText = "❌ " + msg;
             return;
         }
 
-        if (ct.includes("application/json")) {
-            status.innerText =
-                "❌ Server returned JSON instead of CSV. Check the preview or dependency health response.";
-            return;
-        }
-
-        const rowCount = res.headers.get("X-Export-Row-Count");
-        const blob = await res.blob();
+        const rowCount = dl.headers.get("X-Export-Row-Count");
+        const blob = await dl.blob();
 
         const a = document.createElement("a");
         a.href = window.URL.createObjectURL(blob);
@@ -982,15 +1004,9 @@ async function exportCSV() {
         } else if (rowCount != null && rowCount !== "") {
             status.innerText = "✅ Done — " + rowCount + " rows";
         } else {
-            status.innerText = "✅ Done (redeploy API to show row count in status)";
+            status.innerText = "✅ Done";
         }
-
     } catch (err) {
-        if (err && err.name === "AbortError") {
-            status.innerText =
-                "❌ Export exceeded 30 minute browser limit. Increase timeout in hosting settings or reduce scope.";
-            return;
-        }
         const fallback = (err && err.message) || "Network error";
         const diag = await fetchDependencyHealth();
         status.innerText = "❌ " + (summarizeDependencyHealth(diag) || fallback);
