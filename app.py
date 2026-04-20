@@ -495,7 +495,8 @@ def normalize_email(s):
 def _get_signal_scores_chunk(
     bq_client, customer_ids: list[str], *, score_column: str, out_column: str
 ) -> pd.DataFrame:
-    query = """
+    # Must be an f-string: column names (recency_score / behavior_score) are interpolated into SQL.
+    query = f"""
     WITH target_customers AS (
         SELECT customer_id
         FROM UNNEST(@customer_ids) AS customer_id
