@@ -813,7 +813,7 @@ async function refreshAudiencePreview() {
         empty.style.display = "block";
         const hint =
             (err && err.message) ||
-            "Check Render logs. Set DB_* and BQ_CREDENTIALS_JSON (or BQ_CREDENTIALS_JSON_B64), then redeploy.";
+            "Check Render logs. Set DB_* plus BQ_PRIVATE_KEY and BQ_PRIVATE_KEY_ID, then redeploy.";
         empty.textContent = hint;
     }
 }
