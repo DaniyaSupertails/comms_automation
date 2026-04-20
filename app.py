@@ -12,6 +12,14 @@ Comms audience export API — matches `70. comms_backend (2).ipynb` step-for-ste
 6) comms_label / cohort / monthly cohort / Telle / purchase / daily_target / enrichment chain.
 
 Configure via environment: DB_*, BQ_PRIVATE_KEY, BQ_PRIVATE_KEY_ID (optional SHOW_ERROR_DETAILS).
+BQ_SIGNAL_FULL_TABLE=1 enables notebook full-table BQ pulls (default off — use eligible-scoped
+chunked BQ on Render to avoid 502 from timeouts/OOM).
+
+Performance (defaults tuned for speed): PIPELINE_PARALLEL_MYSQL=1 runs comms/cust/base on
+separate DB connections; BQ_CHUNK_PARALLEL (default 4) runs combined BQ chunks concurrently;
+BQ_CUSTOMER_CHUNK_SIZE (default 12000) trades memory for fewer BQ jobs. Install pyarrow +
+google-cloud-bigquery-storage for faster BigQuery downloads.
+
 BigQuery non-secret fields are defined in _BQ_SERVICE_ACCOUNT_PUBLIC below.
 """
 
@@ -21,6 +29,7 @@ import io
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Literal
 
@@ -250,7 +259,17 @@ DELIVERY_COPY_MAP = {
 FALLBACK_PRODUCT_COHORTS = {"Recency", "Behavior", "Generic"}
 
 IN_CHUNK_SIZE = int(os.getenv("SQL_IN_CHUNK_SIZE", "3000"))
+BQ_CUSTOMER_CHUNK_SIZE = int(os.getenv("BQ_CUSTOMER_CHUNK_SIZE", "12000"))
+BQ_CHUNK_PARALLEL = max(1, int(os.getenv("BQ_CHUNK_PARALLEL", "4")))
 
+
+def _is_pipeline_parallel_mysql() -> bool:
+    return (os.getenv("PIPELINE_PARALLEL_MYSQL", "1").strip().lower() in ("1", "true", "yes"))
+
+# Full-table BQ pulls match the notebook but often OOM or exceed Render’s proxy timeout → 502.
+# Default: eligible-scoped chunked BQ (same QUALIFY per customer_id, only for DOA customers).
+# Set BQ_SIGNAL_FULL_TABLE=1 only when you need exact notebook full scans (e.g. local batch).
+# ---------------------------------------------------------------------------
 # Notebook `70. comms_backend (2).ipynb` — full-table signal extracts (verbatim SQL).
 RECENCY_SIGNAL_SQL = """
 SELECT
@@ -616,6 +635,210 @@ def get_signals_notebook(bq_client, cust: pd.DataFrame) -> pd.DataFrame:
     signals = signals.dropna(subset=["email"])
     assert signals["email"].notna().all()
     assert signals["email"].is_unique
+    return signals
+
+
+def _use_full_table_bq_signals() -> bool:
+    return (os.getenv("BQ_SIGNAL_FULL_TABLE", "0").strip().lower() in ("1", "true", "yes"))
+
+
+def _get_combined_signal_chunk(bq_client, customer_ids: list[str]) -> pd.DataFrame:
+    """
+    One BigQuery job per chunk: best recency row + best behavior row per customer_id,
+    then FULL OUTER JOIN. Replaces two separate BQ round-trips per chunk (~2x faster BQ phase).
+    """
+    if not customer_ids:
+        return pd.DataFrame(
+            columns=[
+                "customer_id",
+                "recency_category",
+                "recency_score",
+                "behavior_category",
+                "behavior_score",
+            ]
+        )
+    query = """
+    WITH target_customers AS (
+        SELECT customer_id
+        FROM UNNEST(@customer_ids) AS customer_id
+    ),
+    rec AS (
+        SELECT
+            CAST(src.customer_id AS STRING) AS customer_id,
+            src.ah_category AS recency_category,
+            src.recency_score,
+            src.behavior_score
+        FROM (
+            SELECT
+                CAST(src.customer_id AS STRING) AS customer_id,
+                src.ah_category,
+                src.recency_score,
+                src.behavior_score,
+                ROW_NUMBER() OVER (
+                    PARTITION BY CAST(src.customer_id AS STRING)
+                    ORDER BY src.recency_score DESC
+                ) AS rn
+            FROM `ga4-data-api-1681899023728.cx_signal_final.cx_signal_ah` src
+            INNER JOIN target_customers t
+                ON CAST(src.customer_id AS STRING) = t.customer_id
+            WHERE src.ah_category NOT IN ('CLINIC & AHS', 'OTHERS')
+              AND src.recency_score IS NOT NULL
+        ) src
+        WHERE src.rn = 1
+    ),
+    beh AS (
+        SELECT
+            CAST(src.customer_id AS STRING) AS customer_id,
+            src.ah_category AS behavior_category,
+            src.recency_score,
+            src.behavior_score
+        FROM (
+            SELECT
+                CAST(src.customer_id AS STRING) AS customer_id,
+                src.ah_category,
+                src.recency_score,
+                src.behavior_score,
+                ROW_NUMBER() OVER (
+                    PARTITION BY CAST(src.customer_id AS STRING)
+                    ORDER BY src.behavior_score DESC
+                ) AS rn
+            FROM `ga4-data-api-1681899023728.cx_signal_final.cx_signal_ah` src
+            INNER JOIN target_customers t
+                ON CAST(src.customer_id AS STRING) = t.customer_id
+            WHERE src.ah_category NOT IN ('CLINIC & AHS', 'OTHERS')
+              AND src.behavior_score IS NOT NULL
+        ) src
+        WHERE src.rn = 1
+    )
+    SELECT
+        COALESCE(rec.customer_id, beh.customer_id) AS customer_id,
+        rec.recency_category,
+        rec.recency_score,
+        beh.behavior_category,
+        beh.behavior_score
+    FROM rec
+    FULL OUTER JOIN beh
+        ON rec.customer_id = beh.customer_id
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("customer_ids", "STRING", customer_ids)
+        ]
+    )
+    try:
+        df = bq_client.query(query, job_config=job_config).to_dataframe(
+            create_bqstorage_client=True
+        )
+    except Exception:
+        logger.info("BQ Storage API path failed; retrying default to_dataframe()")
+        df = bq_client.query(query, job_config=job_config).to_dataframe()
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "customer_id",
+                "recency_category",
+                "recency_score",
+                "behavior_category",
+                "behavior_score",
+            ]
+        )
+    df["customer_id"] = df["customer_id"].map(_normalize_customer_id)
+    return df
+
+
+def _build_signal_table(
+    raw_df: pd.DataFrame, cust_map: pd.DataFrame, *, score_column: str, out_column: str
+) -> pd.DataFrame:
+    if raw_df.empty:
+        return pd.DataFrame(columns=["email", out_column])
+    merged = raw_df.merge(
+        cust_map[["customer_id", "email"]],
+        on="customer_id",
+        how="left",
+        validate="many_to_one",
+    )
+    merged["email"] = merged["email"].apply(normalize_email)
+    signal_df = (
+        merged.sort_values(score_column, ascending=False)
+        .drop_duplicates("email", keep="first")
+        [["email", out_column]]
+        .dropna(subset=["email"])
+        .reset_index(drop=True)
+    )
+    if not signal_df["email"].is_unique:
+        raise ValueError(f"{out_column} emails are not unique")
+    return signal_df
+
+
+def get_signals_eligible_scoped(
+    bq_client, cust_map: pd.DataFrame, customer_ids: list[str]
+) -> pd.DataFrame:
+    """Notebook merge semantics; BQ restricted to eligible customer_ids (avoids Render 502)."""
+    customer_ids = [cid for cid in map(_normalize_customer_id, customer_ids) if cid]
+    if not customer_ids:
+        return pd.DataFrame(columns=["email", "recency_category", "behavior_category"])
+
+    chunks: list[list[str]] = [
+        customer_ids[i : i + BQ_CUSTOMER_CHUNK_SIZE]
+        for i in range(0, len(customer_ids), BQ_CUSTOMER_CHUNK_SIZE)
+    ]
+    logger.info(
+        "BQ combined signal chunks: count=%s parallel=%s chunk_size_cap=%s",
+        len(chunks),
+        BQ_CHUNK_PARALLEL,
+        BQ_CUSTOMER_CHUNK_SIZE,
+    )
+
+    def _fetch_combined(ch: list[str]) -> pd.DataFrame:
+        return _get_combined_signal_chunk(bq_client, ch)
+
+    if BQ_CHUNK_PARALLEL <= 1:
+        combined_frames = [_fetch_combined(ch) for ch in chunks]
+    else:
+        with ThreadPoolExecutor(max_workers=BQ_CHUNK_PARALLEL) as ex:
+            combined_frames = list(ex.map(_fetch_combined, chunks))
+
+    combined = (
+        pd.concat(combined_frames, ignore_index=True) if combined_frames else pd.DataFrame()
+    )
+
+    if combined.empty:
+        recent_raw = pd.DataFrame(
+            columns=["customer_id", "recency_category", "recency_score"]
+        )
+        behavior_raw = pd.DataFrame(
+            columns=["customer_id", "behavior_category", "behavior_score"]
+        )
+    else:
+        recent_raw = combined[
+            ["customer_id", "recency_category", "recency_score"]
+        ].dropna(subset=["recency_score"])
+        behavior_raw = combined[
+            ["customer_id", "behavior_category", "behavior_score"]
+        ].dropna(subset=["behavior_score"])
+
+    recent_signal = _build_signal_table(
+        recent_raw,
+        cust_map,
+        score_column="recency_score",
+        out_column="recency_category",
+    )
+    behavior_signal = _build_signal_table(
+        behavior_raw,
+        cust_map,
+        score_column="behavior_score",
+        out_column="behavior_category",
+    )
+
+    signals = recent_signal.merge(
+        behavior_signal,
+        on="email",
+        how="outer",
+        validate="one_to_one",
+    )
+    signals = signals.drop_duplicates().dropna(subset=["email"]).reset_index(drop=True)
+    if not signals.empty and not signals["email"].is_unique:
+        raise ValueError("Signals emails are not unique")
     return signals
 
 
@@ -1002,15 +1225,52 @@ def _mysql_disable_max_execution_time(cnx) -> None:
         logger.warning("Could not SET SESSION MAX_EXECUTION_TIME=0: %s", e)
 
 
+def _mysql_run_isolated(fn):
+    """Run fn(cnx) on a fresh connection (thread-safe; used for parallel MySQL bootstrap)."""
+    cnx = get_db_connection()
+    try:
+        _mysql_disable_max_execution_time(cnx)
+        return fn(cnx)
+    finally:
+        cnx.close()
+
+
 def run_pipeline(req: AudienceRequest, cnx, bq) -> pd.DataFrame:
     _mysql_disable_max_execution_time(cnx)
-    # Notebook order: comms_base → full BQ signals + cust → DOA base → merges
-    comms = build_comms_collapsed(cnx)
-    cust = load_cust_for_signals(cnx)
-    signals = get_signals_notebook(bq, cust)
-    logger.info("pipeline signal rows (full BQ + cust merge)=%s", len(signals))
-
-    base = get_eligible_customers(cnx)
+    # Notebook order: comms_base → BQ signals + cust → DOA base → merges.
+    # Default BQ path is eligible-scoped (chunked) so Render does not return 502 on full scans.
+    if _use_full_table_bq_signals():
+        logger.warning(
+            "BQ_SIGNAL_FULL_TABLE is on: full-table BQ scans (slow; may still timeout on small workers)."
+        )
+        if _is_pipeline_parallel_mysql():
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                f_comms = ex.submit(_mysql_run_isolated, build_comms_collapsed)
+                f_cust = ex.submit(_mysql_run_isolated, load_cust_for_signals)
+                comms, cust = f_comms.result(), f_cust.result()
+        else:
+            comms = build_comms_collapsed(cnx)
+            cust = load_cust_for_signals(cnx)
+        signals = get_signals_notebook(bq, cust)
+        logger.info("pipeline signal rows (full BQ + cust merge)=%s", len(signals))
+        base = get_eligible_customers(cnx)
+    else:
+        if _is_pipeline_parallel_mysql():
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                f_comms = ex.submit(_mysql_run_isolated, build_comms_collapsed)
+                f_cust = ex.submit(_mysql_run_isolated, load_cust_for_signals)
+                f_base = ex.submit(_mysql_run_isolated, get_eligible_customers)
+                comms, cust, base = f_comms.result(), f_cust.result(), f_base.result()
+        else:
+            comms = build_comms_collapsed(cnx)
+            cust = load_cust_for_signals(cnx)
+            base = get_eligible_customers(cnx)
+        signals = get_signals_eligible_scoped(
+            bq,
+            cust,
+            base["customer_id"].astype(str).unique().tolist(),
+        )
+        logger.info("pipeline signal rows (eligible-scoped BQ + cust merge)=%s", len(signals))
     base_enriched = base.merge(comms, on="email", how="left", validate="one_to_one")
     base_enriched["segment"] = base_enriched["segment"].fillna("Generic")
 
