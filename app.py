@@ -1031,16 +1031,27 @@ def _preview_rows_from_df(df: pd.DataFrame, limit: int = 50) -> tuple[int, list[
 
 
 def run_pipeline(req: AudienceRequest, cnx, bq, *, preview: bool = False) -> pd.DataFrame:
-    parallel = os.getenv("PIPELINE_PARALLEL_BOOTSTRAP", "1").lower() in ("1", "true", "yes")
+    parallel = os.getenv("PIPELINE_PARALLEL_BOOTSTRAP", "0").lower() in ("1", "true", "yes")
     if parallel:
-        eligible, comms, cust_map = _parallel_load_mysql_bootstrap()
+        eligible, comms, _ = _parallel_load_mysql_bootstrap()
     else:
         eligible = get_eligible_customers(cnx)
         comms = build_comms_collapsed(cnx)
-        cust_map = get_customer_email_map(cnx)
 
     df = merge_eligible_with_comms(eligible, comms)
     logger.info("pipeline rows after eligible+comms merge=%s", len(df))
+
+    # Notebook semantics: only signal rows for base-eligible customers matter downstream.
+    cust_map = (
+        eligible[["customer_id", "email"]]
+        .copy()
+        .assign(
+            customer_id=lambda x: x["customer_id"].astype(str),
+            email=lambda x: x["email"].apply(normalize_email),
+        )
+        .dropna(subset=["email"])
+        .drop_duplicates("customer_id")
+    )
 
     signals = get_signals(
         bq,
