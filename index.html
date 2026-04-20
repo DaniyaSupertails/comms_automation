@@ -893,12 +893,13 @@ async function exportCSV() {
 
         const ct = (res.headers.get("content-type") || "").toLowerCase();
         if (!res.ok) {
+            const text = await res.text();
             let msg = `Export failed (${res.status})`;
             try {
-                const j = await res.json();
+                const j = JSON.parse(text);
                 if (j.detail) msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
-            } catch (_) {
-                msg = await res.text() || msg;
+            } catch {
+                msg = text || msg;
             }
             status.innerText = "❌ " + msg;
             return;
