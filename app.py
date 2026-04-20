@@ -1,26 +1,23 @@
 """
-Comms audience export API — matches `70. comms_backend (2).ipynb` step-for-step:
+Comms audience export API — `70. comms_backend (2).ipynb` flow (same order and logic):
 
-1) comms_base: two-stage collapse (priority, then segment_priority + total_inventory).
-2) BQ: full-table QUALIFY queries on `cx_signal_ah` for recency_score and behavior_score
-   (same SQL strings as the notebook).
-3) cust: `cx_identifier` LEFT JOIN `cx_profile_attributes` (customer_id, email, payment_card_issuer);
-   merge onto BQ rows, then build recent_signal / behavior_signal and outer-merge signals on email.
-4) base: DOA-eligible customers from cx_identifier + profile.
-5) base_enriched = base.merge(comms, on="email", how="left"); fill segment NA with Generic;
-   final = base_enriched.merge(signals, on="email", how="left").
-6) comms_label / cohort / monthly cohort / Telle / purchase / daily_target / enrichment chain.
+  • Load & collapse comms_base (two-stage: priority, then segment_priority + total_inventory).
+  • cust: cx_identifier + cx_profile (customer_id, email, payment_card_issuer).
+  • BigQuery: full-table RECENCY_SIGNAL_SQL + BEHAVIOR_SIGNAL_SQL (QUALIFY …), merge cust,
+    build recent_signal / behavior_signal, outer-merge → signals.
+  • base: DOA customers (cx_identifier + profile, normalize email, dedupe by email).
+  • base_enriched = base.merge(comms, on="email", how="left"); segment fillna "Generic".
+  • final = base_enriched.merge(signals, on="email", how="left").
+  • comms_label / comms_cohort / dedupe by priority_rank.
+  • monthly_customer_cohorts_v2 → Telle filter → purchase window → daily_target cap.
+  • Enrichment: product URLs → comms_cohort1 + campaign_id → Shopify tags → CX bundle → copy_2.
 
-Configure via environment: DB_*, BQ_PRIVATE_KEY, BQ_PRIVATE_KEY_ID (optional SHOW_ERROR_DETAILS).
-BQ_SIGNAL_FULL_TABLE=1 enables notebook full-table BQ pulls (default off — use eligible-scoped
-chunked BQ on Render to avoid 502 from timeouts/OOM).
+Configure: DB_*, BQ_PRIVATE_KEY, BQ_PRIVATE_KEY_ID (optional SHOW_ERROR_DETAILS).
+Heavy work runs in a background thread: POST /audience-preview and POST /export-csv return 202 + job_id;
+the client polls GET /jobs/{id} so the edge proxy does not hold a long HTTP connection (avoids 502 timeouts).
+In-memory jobs require a single HTTP worker (e.g. uvicorn --workers 1); multiple workers need shared job storage.
 
-Performance (defaults tuned for speed): PIPELINE_PARALLEL_MYSQL=1 runs comms/cust/base on
-separate DB connections; BQ_CHUNK_PARALLEL (default 4) runs combined BQ chunks concurrently;
-BQ_CUSTOMER_CHUNK_SIZE (default 12000) trades memory for fewer BQ jobs. Install pyarrow +
-google-cloud-bigquery-storage for faster BigQuery downloads.
-
-BigQuery non-secret fields are defined in _BQ_SERVICE_ACCOUNT_PUBLIC below.
+BigQuery non-secret fields: _BQ_SERVICE_ACCOUNT_PUBLIC below.
 """
 
 from __future__ import annotations
@@ -29,16 +26,18 @@ import io
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 import mysql.connector as sql
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from google.cloud import bigquery
 from google.oauth2 import service_account
 from pydantic import BaseModel, Field
@@ -259,16 +258,7 @@ DELIVERY_COPY_MAP = {
 FALLBACK_PRODUCT_COHORTS = {"Recency", "Behavior", "Generic"}
 
 IN_CHUNK_SIZE = int(os.getenv("SQL_IN_CHUNK_SIZE", "3000"))
-BQ_CUSTOMER_CHUNK_SIZE = int(os.getenv("BQ_CUSTOMER_CHUNK_SIZE", "12000"))
-BQ_CHUNK_PARALLEL = max(1, int(os.getenv("BQ_CHUNK_PARALLEL", "4")))
 
-
-def _is_pipeline_parallel_mysql() -> bool:
-    return (os.getenv("PIPELINE_PARALLEL_MYSQL", "1").strip().lower() in ("1", "true", "yes"))
-
-# Full-table BQ pulls match the notebook but often OOM or exceed Render’s proxy timeout → 502.
-# Default: eligible-scoped chunked BQ (same QUALIFY per customer_id, only for DOA customers).
-# Set BQ_SIGNAL_FULL_TABLE=1 only when you need exact notebook full scans (e.g. local batch).
 # ---------------------------------------------------------------------------
 # Notebook `70. comms_backend (2).ipynb` — full-table signal extracts (verbatim SQL).
 RECENCY_SIGNAL_SQL = """
@@ -488,10 +478,11 @@ def _dependency_health_details() -> dict[str, object]:
 
 
 # ---------------------------------------------------------------------------
-# Step 0: Eligible base (DOA filter) — notebook cx_identifier + profile
+# Notebook: base (DOA) — after signals in notebook cell order; function kept for merge step.
 # ---------------------------------------------------------------------------
 def get_eligible_customers(cnx) -> pd.DataFrame:
-    query = f"""
+    """Notebook: cx_identifier + profile where customer_doa IS NOT NULL; normalize_email; dedupe email."""
+    query = """
         SELECT id.customer_id, id.email
         FROM cx_identifier id
         LEFT JOIN cx_profile_attributes cx ON id.customer_id = cx.customer_id
@@ -499,15 +490,16 @@ def get_eligible_customers(cnx) -> pd.DataFrame:
     """
     df = pd.read_sql(query, cnx)
     df["customer_id"] = df["customer_id"].astype(str)
-    df["email"] = df["email"].str.strip().str.lower()
+    df["email"] = df["email"].apply(normalize_email)
     df = df.dropna(subset=["email"]).drop_duplicates("email").reset_index(drop=True)
     if not df["email"].is_unique:
         raise ValueError("Eligible customer emails are not unique")
+    assert df["email"].is_unique
     return df
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Collapse comms_base to one row per email (notebook df)
+# Notebook: comms_base → df (two-stage collapse)
 # ---------------------------------------------------------------------------
 def build_comms_collapsed(cnx) -> pd.DataFrame:
     """Notebook: SELECT * semantics; comms_base is email-keyed (no customer_id column)."""
@@ -553,7 +545,7 @@ def build_comms_collapsed(cnx) -> pd.DataFrame:
 
 
 def load_cust_for_signals(cnx) -> pd.DataFrame:
-    """Notebook `cust`: cx_identifier + profile (used to map BQ customer_id → email)."""
+    """Notebook `cust` query: customer_id, email, payment_card_issuer for BQ → email merge."""
     query = """
         SELECT id.customer_id, id.email, cx.payment_card_issuer
         FROM cx_identifier id
@@ -574,7 +566,7 @@ def _bq_query_to_dataframe(bq_client, query: str) -> pd.DataFrame:
 
 
 def get_signals_notebook(bq_client, cust: pd.DataFrame) -> pd.DataFrame:
-    """Notebook: full BQ pulls → merge cust → recent_signal / behavior_signal → outer merge."""
+    """Notebook: query_job recent + behavior → merge cust → recent_signal / behavior_signal → signals."""
     recent = _bq_query_to_dataframe(bq_client, RECENCY_SIGNAL_SQL)
     behavior = _bq_query_to_dataframe(bq_client, BEHAVIOR_SIGNAL_SQL)
 
@@ -638,212 +630,8 @@ def get_signals_notebook(bq_client, cust: pd.DataFrame) -> pd.DataFrame:
     return signals
 
 
-def _use_full_table_bq_signals() -> bool:
-    return (os.getenv("BQ_SIGNAL_FULL_TABLE", "0").strip().lower() in ("1", "true", "yes"))
-
-
-def _get_combined_signal_chunk(bq_client, customer_ids: list[str]) -> pd.DataFrame:
-    """
-    One BigQuery job per chunk: best recency row + best behavior row per customer_id,
-    then FULL OUTER JOIN. Replaces two separate BQ round-trips per chunk (~2x faster BQ phase).
-    """
-    if not customer_ids:
-        return pd.DataFrame(
-            columns=[
-                "customer_id",
-                "recency_category",
-                "recency_score",
-                "behavior_category",
-                "behavior_score",
-            ]
-        )
-    query = """
-    WITH target_customers AS (
-        SELECT customer_id
-        FROM UNNEST(@customer_ids) AS customer_id
-    ),
-    rec AS (
-        SELECT
-            CAST(src.customer_id AS STRING) AS customer_id,
-            src.ah_category AS recency_category,
-            src.recency_score,
-            src.behavior_score
-        FROM (
-            SELECT
-                CAST(src.customer_id AS STRING) AS customer_id,
-                src.ah_category,
-                src.recency_score,
-                src.behavior_score,
-                ROW_NUMBER() OVER (
-                    PARTITION BY CAST(src.customer_id AS STRING)
-                    ORDER BY src.recency_score DESC
-                ) AS rn
-            FROM `ga4-data-api-1681899023728.cx_signal_final.cx_signal_ah` src
-            INNER JOIN target_customers t
-                ON CAST(src.customer_id AS STRING) = t.customer_id
-            WHERE src.ah_category NOT IN ('CLINIC & AHS', 'OTHERS')
-              AND src.recency_score IS NOT NULL
-        ) src
-        WHERE src.rn = 1
-    ),
-    beh AS (
-        SELECT
-            CAST(src.customer_id AS STRING) AS customer_id,
-            src.ah_category AS behavior_category,
-            src.recency_score,
-            src.behavior_score
-        FROM (
-            SELECT
-                CAST(src.customer_id AS STRING) AS customer_id,
-                src.ah_category,
-                src.recency_score,
-                src.behavior_score,
-                ROW_NUMBER() OVER (
-                    PARTITION BY CAST(src.customer_id AS STRING)
-                    ORDER BY src.behavior_score DESC
-                ) AS rn
-            FROM `ga4-data-api-1681899023728.cx_signal_final.cx_signal_ah` src
-            INNER JOIN target_customers t
-                ON CAST(src.customer_id AS STRING) = t.customer_id
-            WHERE src.ah_category NOT IN ('CLINIC & AHS', 'OTHERS')
-              AND src.behavior_score IS NOT NULL
-        ) src
-        WHERE src.rn = 1
-    )
-    SELECT
-        COALESCE(rec.customer_id, beh.customer_id) AS customer_id,
-        rec.recency_category,
-        rec.recency_score,
-        beh.behavior_category,
-        beh.behavior_score
-    FROM rec
-    FULL OUTER JOIN beh
-        ON rec.customer_id = beh.customer_id
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ArrayQueryParameter("customer_ids", "STRING", customer_ids)
-        ]
-    )
-    try:
-        df = bq_client.query(query, job_config=job_config).to_dataframe(
-            create_bqstorage_client=True
-        )
-    except Exception:
-        logger.info("BQ Storage API path failed; retrying default to_dataframe()")
-        df = bq_client.query(query, job_config=job_config).to_dataframe()
-    if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "customer_id",
-                "recency_category",
-                "recency_score",
-                "behavior_category",
-                "behavior_score",
-            ]
-        )
-    df["customer_id"] = df["customer_id"].map(_normalize_customer_id)
-    return df
-
-
-def _build_signal_table(
-    raw_df: pd.DataFrame, cust_map: pd.DataFrame, *, score_column: str, out_column: str
-) -> pd.DataFrame:
-    if raw_df.empty:
-        return pd.DataFrame(columns=["email", out_column])
-    merged = raw_df.merge(
-        cust_map[["customer_id", "email"]],
-        on="customer_id",
-        how="left",
-        validate="many_to_one",
-    )
-    merged["email"] = merged["email"].apply(normalize_email)
-    signal_df = (
-        merged.sort_values(score_column, ascending=False)
-        .drop_duplicates("email", keep="first")
-        [["email", out_column]]
-        .dropna(subset=["email"])
-        .reset_index(drop=True)
-    )
-    if not signal_df["email"].is_unique:
-        raise ValueError(f"{out_column} emails are not unique")
-    return signal_df
-
-
-def get_signals_eligible_scoped(
-    bq_client, cust_map: pd.DataFrame, customer_ids: list[str]
-) -> pd.DataFrame:
-    """Notebook merge semantics; BQ restricted to eligible customer_ids (avoids Render 502)."""
-    customer_ids = [cid for cid in map(_normalize_customer_id, customer_ids) if cid]
-    if not customer_ids:
-        return pd.DataFrame(columns=["email", "recency_category", "behavior_category"])
-
-    chunks: list[list[str]] = [
-        customer_ids[i : i + BQ_CUSTOMER_CHUNK_SIZE]
-        for i in range(0, len(customer_ids), BQ_CUSTOMER_CHUNK_SIZE)
-    ]
-    logger.info(
-        "BQ combined signal chunks: count=%s parallel=%s chunk_size_cap=%s",
-        len(chunks),
-        BQ_CHUNK_PARALLEL,
-        BQ_CUSTOMER_CHUNK_SIZE,
-    )
-
-    def _fetch_combined(ch: list[str]) -> pd.DataFrame:
-        return _get_combined_signal_chunk(bq_client, ch)
-
-    if BQ_CHUNK_PARALLEL <= 1:
-        combined_frames = [_fetch_combined(ch) for ch in chunks]
-    else:
-        with ThreadPoolExecutor(max_workers=BQ_CHUNK_PARALLEL) as ex:
-            combined_frames = list(ex.map(_fetch_combined, chunks))
-
-    combined = (
-        pd.concat(combined_frames, ignore_index=True) if combined_frames else pd.DataFrame()
-    )
-
-    if combined.empty:
-        recent_raw = pd.DataFrame(
-            columns=["customer_id", "recency_category", "recency_score"]
-        )
-        behavior_raw = pd.DataFrame(
-            columns=["customer_id", "behavior_category", "behavior_score"]
-        )
-    else:
-        recent_raw = combined[
-            ["customer_id", "recency_category", "recency_score"]
-        ].dropna(subset=["recency_score"])
-        behavior_raw = combined[
-            ["customer_id", "behavior_category", "behavior_score"]
-        ].dropna(subset=["behavior_score"])
-
-    recent_signal = _build_signal_table(
-        recent_raw,
-        cust_map,
-        score_column="recency_score",
-        out_column="recency_category",
-    )
-    behavior_signal = _build_signal_table(
-        behavior_raw,
-        cust_map,
-        score_column="behavior_score",
-        out_column="behavior_category",
-    )
-
-    signals = recent_signal.merge(
-        behavior_signal,
-        on="email",
-        how="outer",
-        validate="one_to_one",
-    )
-    signals = signals.drop_duplicates().dropna(subset=["email"]).reset_index(drop=True)
-    if not signals.empty and not signals["email"].is_unique:
-        raise ValueError("Signals emails are not unique")
-    return signals
-
-
 # ---------------------------------------------------------------------------
-# Step 3: Comms logic + dedupe
+# Step 3: Comms logic + dedupe (notebook np.select + COHORT_PRIORITY dedupe)
 # ---------------------------------------------------------------------------
 def apply_comms_logic(df: pd.DataFrame) -> pd.DataFrame:
     conditions = [
@@ -1225,52 +1013,17 @@ def _mysql_disable_max_execution_time(cnx) -> None:
         logger.warning("Could not SET SESSION MAX_EXECUTION_TIME=0: %s", e)
 
 
-def _mysql_run_isolated(fn):
-    """Run fn(cnx) on a fresh connection (thread-safe; used for parallel MySQL bootstrap)."""
-    cnx = get_db_connection()
-    try:
-        _mysql_disable_max_execution_time(cnx)
-        return fn(cnx)
-    finally:
-        cnx.close()
-
-
 def run_pipeline(req: AudienceRequest, cnx, bq) -> pd.DataFrame:
+    """
+    Same cell order as the notebook: comms → cust → full-table BQ signals → DOA base → merges → filters → enrich.
+    Uses one MySQL connection for all MySQL steps (matches interactive notebook execution).
+    """
     _mysql_disable_max_execution_time(cnx)
-    # Notebook order: comms_base → BQ signals + cust → DOA base → merges.
-    # Default BQ path is eligible-scoped (chunked) so Render does not return 502 on full scans.
-    if _use_full_table_bq_signals():
-        logger.warning(
-            "BQ_SIGNAL_FULL_TABLE is on: full-table BQ scans (slow; may still timeout on small workers)."
-        )
-        if _is_pipeline_parallel_mysql():
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                f_comms = ex.submit(_mysql_run_isolated, build_comms_collapsed)
-                f_cust = ex.submit(_mysql_run_isolated, load_cust_for_signals)
-                comms, cust = f_comms.result(), f_cust.result()
-        else:
-            comms = build_comms_collapsed(cnx)
-            cust = load_cust_for_signals(cnx)
-        signals = get_signals_notebook(bq, cust)
-        logger.info("pipeline signal rows (full BQ + cust merge)=%s", len(signals))
-        base = get_eligible_customers(cnx)
-    else:
-        if _is_pipeline_parallel_mysql():
-            with ThreadPoolExecutor(max_workers=3) as ex:
-                f_comms = ex.submit(_mysql_run_isolated, build_comms_collapsed)
-                f_cust = ex.submit(_mysql_run_isolated, load_cust_for_signals)
-                f_base = ex.submit(_mysql_run_isolated, get_eligible_customers)
-                comms, cust, base = f_comms.result(), f_cust.result(), f_base.result()
-        else:
-            comms = build_comms_collapsed(cnx)
-            cust = load_cust_for_signals(cnx)
-            base = get_eligible_customers(cnx)
-        signals = get_signals_eligible_scoped(
-            bq,
-            cust,
-            base["customer_id"].astype(str).unique().tolist(),
-        )
-        logger.info("pipeline signal rows (eligible-scoped BQ + cust merge)=%s", len(signals))
+    comms = build_comms_collapsed(cnx)
+    cust = load_cust_for_signals(cnx)
+    signals = get_signals_notebook(bq, cust)
+    logger.info("pipeline signal rows (full BQ + cust merge)=%s", len(signals))
+    base = get_eligible_customers(cnx)
     base_enriched = base.merge(comms, on="email", how="left", validate="one_to_one")
     base_enriched["segment"] = base_enriched["segment"].fillna("Generic")
 
@@ -1301,6 +1054,130 @@ def run_pipeline(req: AudienceRequest, cnx, bq) -> pd.DataFrame:
     logger.info("pipeline rows after daily target=%s", len(df))
     # Notebook has one enrichment path; preview uses the same logic as export (first N rows only in API).
     return enrich_final_payload(df, cnx)
+
+
+# ---------------------------------------------------------------------------
+# Background jobs (short HTTP — proxy friendly)
+# ---------------------------------------------------------------------------
+_JOB_TTL_DONE_SEC = float(os.getenv("JOB_TTL_DONE_SEC", "7200"))
+
+_jobs_lock = threading.Lock()
+_jobs: dict[str, dict[str, Any]] = {}
+
+
+def _prune_jobs() -> None:
+    now = time.time()
+    with _jobs_lock:
+        to_del = [
+            jid
+            for jid, j in _jobs.items()
+            if j.get("status") in ("done", "error")
+            and now - float(j.get("created_at", 0)) > _JOB_TTL_DONE_SEC
+        ]
+        for jid in to_del:
+            del _jobs[jid]
+
+
+def _preview_worker(job_id: str, payload: dict) -> None:
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["status"] = "running"
+    cnx = None
+    try:
+        req = AudienceRequest(**payload)
+        cnx = get_db_connection()
+        bq = get_bq_client()
+        df = run_pipeline(req, cnx, bq)
+        count, rows = _preview_rows_from_df(df, limit=50)
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id].update(status="done", count=count, preview=rows)
+    except Exception as e:
+        logger.exception("preview job %s failed", job_id)
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id].update(status="error", error=http_detail(e))
+    finally:
+        if cnx is not None:
+            cnx.close()
+
+
+def _export_worker(job_id: str, payload: dict) -> None:
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["status"] = "running"
+    cnx = None
+    try:
+        req = AudienceRequest(**payload)
+        cnx = get_db_connection()
+        bq = get_bq_client()
+        logger.info(
+            "export job %s start event_type=%s days=%s purchase_days=%s daily_target=%s",
+            job_id,
+            req.event_type,
+            req.days,
+            req.purchase_days,
+            req.daily_target,
+        )
+        df = run_pipeline(req, cnx, bq)
+        n = len(df)
+        buf = io.StringIO()
+        df.to_csv(buf, index=False)
+        csv_text = buf.getvalue()
+        logger.info("export job %s finished rows=%s cols=%s", job_id, n, len(df.columns))
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id].update(status="done", row_count=n, csv_text=csv_text)
+    except Exception as e:
+        logger.exception("export job %s failed", job_id)
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id].update(status="error", error=http_detail(e))
+    finally:
+        if cnx is not None:
+            cnx.close()
+
+
+def _start_preview_job(req: AudienceRequest) -> str:
+    _prune_jobs()
+    job_id = str(uuid.uuid4())
+    payload = req.model_dump()
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "kind": "preview",
+            "status": "queued",
+            "created_at": time.time(),
+            "count": None,
+            "preview": None,
+            "error": None,
+            "csv_text": None,
+            "row_count": None,
+        }
+    threading.Thread(
+        target=_preview_worker, args=(job_id, payload), daemon=True
+    ).start()
+    return job_id
+
+
+def _start_export_job(req: AudienceRequest) -> str:
+    _prune_jobs()
+    job_id = str(uuid.uuid4())
+    payload = req.model_dump()
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "kind": "export",
+            "status": "queued",
+            "created_at": time.time(),
+            "count": None,
+            "preview": None,
+            "error": None,
+            "csv_text": None,
+            "row_count": None,
+        }
+    threading.Thread(
+        target=_export_worker, args=(job_id, payload), daemon=True
+    ).start()
+    return job_id
 
 
 # ---------------------------------------------------------------------------
@@ -1370,63 +1247,94 @@ def get_templates(days: int = Query(7, gt=0, le=365)):
 @app.post("/audience-preview")
 def audience_preview(req: AudienceRequest):
     """
-    Same audience logic as export: returns total match count and the first 50 rows
-    for quick QA in the builder UI.
+    Queue the same audience logic as export; returns 202 + job_id.
+    Poll GET /jobs/{job_id} until status is done, then read count + preview.
     """
-    cnx = None
     try:
-        cnx = get_db_connection()
-        bq = get_bq_client()
-        df = run_pipeline(req, cnx, bq)
-        count, rows = _preview_rows_from_df(df, limit=50)
-        return {"count": count, "preview": rows}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("audience-preview failed")
-        raise HTTPException(status_code=500, detail=http_detail(e)) from e
-    finally:
-        if cnx is not None:
-            cnx.close()
-
-
-@app.post("/export-csv")
-def export_csv(req: AudienceRequest):
-    cnx = None
-    try:
-        cnx = get_db_connection()
-        bq = get_bq_client()
-        logger.info(
-            "export-csv start event_type=%s days=%s purchase_days=%s daily_target=%s",
-            req.event_type,
-            req.days,
-            req.purchase_days,
-            req.daily_target,
-        )
-        df = run_pipeline(req, cnx, bq)
-        n = len(df)
-        logger.info("export-csv finished rows=%s cols=%s", n, len(df.columns))
-        if n == 0:
-            logger.warning(
-                "export-csv: 0 rows — common causes: purchase filter window too tight, "
-                "Telle exclusions removed everyone, or daily_target cohorts empty."
-            )
-        buf = io.StringIO()
-        df.to_csv(buf, index=False)
-        buf.seek(0)
-        return StreamingResponse(
-            buf,
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": "attachment; filename=comms_output.csv",
-                "X-Export-Row-Count": str(n),
+        job_id = _start_preview_job(req)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": "queued",
+                "poll_url": f"/jobs/{job_id}",
             },
         )
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("export-csv failed")
+        logger.exception("audience-preview queue failed")
         raise HTTPException(status_code=500, detail=http_detail(e)) from e
-    finally:
-        if cnx is not None:
-            cnx.close()
+
+
+@app.post("/export-csv")
+def export_csv(req: AudienceRequest):
+    """Queue full CSV build; returns 202 + job_id. When done, GET /jobs/{id}/download."""
+    try:
+        job_id = _start_export_job(req)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": "queued",
+                "poll_url": f"/jobs/{job_id}",
+                "download_url": f"/jobs/{job_id}/download",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("export-csv queue failed")
+        raise HTTPException(status_code=500, detail=http_detail(e)) from e
+
+
+@app.get("/jobs/{job_id}")
+def get_job_status(job_id: str):
+    """Poll job state: queued | running | done | error."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    kind = job["kind"]
+    status = job["status"]
+    out: dict[str, Any] = {"job_id": job_id, "kind": kind, "status": status}
+    if status == "done":
+        if kind == "preview":
+            out["count"] = job["count"]
+            out["preview"] = job["preview"]
+        else:
+            out["row_count"] = job["row_count"]
+            out["download_ready"] = True
+    elif status == "error":
+        out["detail"] = job.get("error") or "Job failed"
+    return out
+
+
+@app.get("/jobs/{job_id}/download")
+def download_export_job(job_id: str):
+    """CSV for a completed export job (short request — binary streamed once)."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    if job.get("kind") != "export":
+        raise HTTPException(status_code=400, detail="Not an export job")
+    if job.get("status") != "done":
+        raise HTTPException(status_code=409, detail="Export not ready yet")
+    csv_text = job.get("csv_text")
+    if not csv_text:
+        raise HTTPException(status_code=500, detail="CSV missing")
+    n = job.get("row_count", 0)
+    if n == 0:
+        logger.warning(
+            "export job %s: 0 rows — purchase filter, Telle exclusions, or daily_target may be empty",
+            job_id,
+        )
+    return StreamingResponse(
+        io.StringIO(csv_text),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=comms_output.csv",
+            "X-Export-Row-Count": str(n),
+        },
+    )
