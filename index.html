@@ -703,6 +703,55 @@ const BASE_URL =
 let selectedEvent = "delivered";
 let previewTimer = null;
 
+function summarizeDependencyHealth(diag) {
+    if (!diag || typeof diag !== "object") return "";
+
+    const messages = [];
+    if (Array.isArray(diag.missing_env) && diag.missing_env.length) {
+        messages.push(`Missing env: ${diag.missing_env.join(", ")}`);
+    }
+    if (diag.database && diag.database.status === "error" && diag.database.detail) {
+        messages.push(`Database: ${diag.database.detail}`);
+    }
+    if (diag.bigquery && diag.bigquery.status === "error" && diag.bigquery.detail) {
+        messages.push(`BigQuery: ${diag.bigquery.detail}`);
+    }
+    return messages.join(" | ");
+}
+
+async function fetchDependencyHealth() {
+    try {
+        const res = await fetch(`${BASE_URL}/dependency-health`);
+        if (!res.ok) return null;
+        return await res.json();
+    } catch (_) {
+        return null;
+    }
+}
+
+async function getActionableError(res, fallback) {
+    const contentType = (res.headers.get("content-type") || "").toLowerCase();
+    const text = await res.text();
+
+    if (contentType.includes("application/json")) {
+        try {
+            const data = JSON.parse(text);
+            if (data.detail) {
+                return typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+            }
+        } catch (_) {
+            // ignore and fall through
+        }
+    }
+
+    if (text && !/<html[\s>]|<!doctype html/i.test(text)) {
+        return text;
+    }
+
+    const diag = await fetchDependencyHealth();
+    return summarizeDependencyHealth(diag) || `${fallback} (${res.status})`;
+}
+
 function buildPayload() {
     const selected_templates = Array.from(
         document.getElementById("templates").selectedOptions
@@ -790,11 +839,7 @@ async function refreshAudiencePreview() {
         });
 
         if (!res.ok) {
-            let detail = await res.text();
-            try {
-                const j = JSON.parse(detail);
-                if (j.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
-            } catch (_) { /* keep text */ }
+            const detail = await getActionableError(res, "Could not load preview");
             throw new Error(detail || res.statusText);
         }
 
@@ -813,7 +858,7 @@ async function refreshAudiencePreview() {
         empty.style.display = "block";
         const hint =
             (err && err.message) ||
-            "Check Render logs. Set DB_* plus BQ_PRIVATE_KEY and BQ_PRIVATE_KEY_ID, then redeploy.";
+            "Could not load preview. Check database and BigQuery connectivity.";
         empty.textContent = hint;
     }
 }
@@ -893,21 +938,14 @@ async function exportCSV() {
 
         const ct = (res.headers.get("content-type") || "").toLowerCase();
         if (!res.ok) {
-            const text = await res.text();
-            let msg = `Export failed (${res.status})`;
-            try {
-                const j = JSON.parse(text);
-                if (j.detail) msg = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
-            } catch {
-                msg = text || msg;
-            }
+            const msg = await getActionableError(res, "Export failed");
             status.innerText = "❌ " + msg;
             return;
         }
 
         if (ct.includes("application/json")) {
             status.innerText =
-                "❌ Server returned JSON instead of CSV — check DB/BQ env vars on Render.";
+                "❌ Server returned JSON instead of CSV. Check the preview or dependency health response.";
             return;
         }
 
@@ -929,7 +967,9 @@ async function exportCSV() {
         }
 
     } catch (err) {
-        status.innerText = "❌ " + ((err && err.message) || "Network error");
+        const fallback = (err && err.message) || "Network error";
+        const diag = await fetchDependencyHealth();
+        status.innerText = "❌ " + (summarizeDependencyHealth(diag) || fallback);
     }
 }
 
